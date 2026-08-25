@@ -164,7 +164,8 @@ func (t Tool) resolveParams(source sources.Source) (parameters.Parameters, error
 	if !ok {
 		return nil, fmt.Errorf("invalid source for %q tool: source %q is not a compatible type", t.Cfg.Type, t.Cfg.Source)
 	}
-	return buildParams(s.GetDefaultProject()), nil
+	project, _ := s.GetDefaultProject()
+	return buildParams(project), nil
 }
 
 // GetParameters returns the tool's parameters, resolved against the source.

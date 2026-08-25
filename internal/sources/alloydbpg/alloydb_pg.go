@@ -67,15 +67,19 @@ func (r Config) SourceConfigType() string {
 	return SourceType
 }
 
-func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
-	pool, err := initAlloyDBPgConnectionPool(ctx, tracer, r.Name, r.Project, r.Region, r.Cluster, r.Instance, r.IPType.String(), r.User, r.Password, r.Database)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create pool: %w", err)
-	}
+func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, lazyInit bool) (sources.Source, error) {
+	var pool *pgxpool.Pool
+	var err error
+	if !lazyInit {
+		pool, err = initAlloyDBPgConnectionPool(ctx, tracer, r.Name, r.Project, r.Region, r.Cluster, r.Instance, r.IPType.String(), r.User, r.Password, r.Database)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create pool: %w", err)
+		}
 
-	err = pool.Ping(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("unable to connect successfully: %w", err)
+		err = pool.Ping(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("unable to connect successfully: %w", err)
+		}
 	}
 
 	s := &Source{
@@ -92,6 +96,14 @@ type Source struct {
 	Pool *pgxpool.Pool
 }
 
+func (s *Source) GetProject() (string, error) {
+	project, err := ExpandEnv(s.Project) // ExpandEnv is a helper function
+	if err != nil {
+		return "", err
+	}
+	return project, nil
+}
+
 func (s *Source) SourceType() string {
 	return SourceType
 }
@@ -100,13 +112,33 @@ func (s *Source) ToConfig() sources.SourceConfig {
 	return s.Config
 }
 
-func (s *Source) PostgresPool() *pgxpool.Pool {
-	return s.Pool
+func (s *Source) PostgresPool(ctx context.Context) (*pgxpool.Pool, error) {
+	if s.Pool == nil { // needs to use sync.Once or something similar for concurrent safe
+		project, err := s.GetProject()
+		if err != nil {
+			return nil, err
+		}
+		pool, err := initAlloyDBPgConnectionPool(ctx, nil, s.Config.Name, project, s.Config.Region, s.Config.Cluster, s.Config.Instance, s.Config.IPType.String(), s.Config.User, s.Config.Password, s.Config.Database)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create pool: %w", err)
+		}
+
+		err = pool.Ping(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("unable to connect successfully: %w", err)
+		}
+		s.Pool = pool
+	}
+	return s.Pool, nil
 }
 
 func (s *Source) RunSQL(ctx context.Context, statement string, params []any) (any, error) {
+	pool, err := s.PostgresPool(ctx)
+	if err != nil {
+		return nil, err
+	}
 	statement = sqlcommenter.PrependComment(ctx, statement, SourceType, s.SQLCommenter)
-	results, err := s.Pool.Query(ctx, statement, params...)
+	results, err := pool.Query(ctx, statement, params...)
 	if err != nil {
 		return nil, fmt.Errorf("unable to execute query: %w", err)
 	}
@@ -186,8 +218,11 @@ func getConnectionConfig(ctx context.Context, user, pass, dbname string) (string
 
 func initAlloyDBPgConnectionPool(ctx context.Context, tracer trace.Tracer, name, project, region, cluster, instance, ipType, user, pass, dbname string) (*pgxpool.Pool, error) {
 	//nolint:all // Reassigned ctx
-	ctx, span := sources.InitConnectionSpan(ctx, tracer, SourceType, name)
-	defer span.End()
+	if tracer != nil {
+		var span trace.Span
+		ctx, span = sources.InitConnectionSpan(ctx, tracer, SourceType, name)
+		defer span.End()
+	}
 
 	dsn, useIAM, err := getConnectionConfig(ctx, user, pass, dbname)
 	if err != nil {
