@@ -97,29 +97,47 @@ func (r Config) SourceConfigType() string {
 	return SourceType
 }
 
-func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
-	retryBaseDelay, err := time.ParseDuration(r.RetryBaseDelay)
-	if err != nil {
-		return nil, fmt.Errorf("invalid retryBaseDelay: %w", err)
+func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
+	s := r.newSource(ctx, tracer)
+	if lazy {
+		return s, nil
 	}
-
-	pool, err := initCockroachDBConnectionPoolWithRetry(ctx, tracer, r.Name, r.Host, r.Port, r.User, r.Password, r.Database, r.QueryParams, r.MaxRetries, retryBaseDelay)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create pool: %w", err)
-	}
-
-	s := &Source{
-		Config: r,
-		Pool:   pool,
+	if _, err := s.pool(ctx); err != nil {
+		return nil, err
 	}
 	return s, nil
+}
+
+func (r Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
+	return &Source{
+		Config: r,
+		tracer: tracer,
+		conn:   sources.NewConnectOnce[*pgxpool.Pool](ctx, r.Name, SourceType, tracer),
+	}
 }
 
 var _ sources.Source = &Source{}
 
 type Source struct {
 	Config
-	Pool *pgxpool.Pool
+	tracer trace.Tracer
+	conn   *sources.ConnectOnce[*pgxpool.Pool]
+}
+
+// pool returns the connection pool, creating it on first use.
+func (s *Source) pool(ctx context.Context) (*pgxpool.Pool, error) {
+	return s.conn.Do(ctx, func(ctx context.Context) (*pgxpool.Pool, error) {
+		retryBaseDelay, err := time.ParseDuration(s.RetryBaseDelay)
+		if err != nil {
+			return nil, fmt.Errorf("invalid retryBaseDelay: %w", err)
+		}
+
+		pool, err := initCockroachDBConnectionPoolWithRetry(ctx, s.tracer, s.Name, s.Host, s.Port, s.User, s.Password, s.Database, s.QueryParams, s.MaxRetries, retryBaseDelay)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create pool: %w", err)
+		}
+		return pool, nil
+	})
 }
 
 func (s *Source) IsReadOnly() bool {
@@ -134,18 +152,30 @@ func (s *Source) ToConfig() sources.SourceConfig {
 	return s.Config
 }
 
+// CockroachDBPool reports the pool if one has been made. It is a type
+// discriminator; a deferred source has not connected yet, so it reports nil
+// until something triggers the connect.
 func (s *Source) CockroachDBPool() *pgxpool.Pool {
-	return s.Pool
+	pool, _ := s.conn.Get()
+	return pool
 }
 
+// PostgresPool reports the pool if one has been made. It is the type
+// discriminator postgres tools assert on; a deferred source has not connected
+// yet, so it reports nil until something triggers the connect.
 func (s *Source) PostgresPool() *pgxpool.Pool {
-	return s.Pool
+	pool, _ := s.conn.Get()
+	return pool
 }
 
 // ExecuteTxWithRetry executes a function within a transaction with automatic retry logic
 // using the official CockroachDB retry mechanism from cockroach-go/v2
 func (s *Source) ExecuteTxWithRetry(ctx context.Context, fn func(pgx.Tx) error) error {
-	return crdbpgx.ExecuteTx(ctx, s.Pool, pgx.TxOptions{}, fn)
+	pool, err := s.pool(ctx)
+	if err != nil {
+		return err
+	}
+	return crdbpgx.ExecuteTx(ctx, pool, pgx.TxOptions{}, fn)
 }
 
 // Query executes a query using the connection pool with MCP security enforcement.
@@ -164,7 +194,12 @@ func (s *Source) Query(ctx context.Context, sql string, args ...interface{}) (pg
 		return nil, err
 	}
 
-	return s.Pool.Query(ctx, modifiedSQL, args...)
+	pool, err := s.pool(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return pool.Query(ctx, modifiedSQL, args...)
 }
 
 // ============================================================================

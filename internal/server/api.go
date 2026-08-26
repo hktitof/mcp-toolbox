@@ -108,9 +108,8 @@ func toolGetHandler(s *Server, w http.ResponseWriter, r *http.Request) {
 		_ = render.Render(w, r, newErrResponse(err, http.StatusNotFound))
 		return
 	}
-	srcName := tool.GetSourceName()
 	var src sources.Source
-	if srcName != "" {
+	if srcName := tool.GetSourceName(); srcName != "" {
 		src, ok = s.PrimitiveMgr.GetSource(srcName)
 		if !ok {
 			err = fmt.Errorf("unable to retrieve source for tool %s", toolName)
@@ -119,9 +118,9 @@ func toolGetHandler(s *Server, w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	toolManifest, err := tool.Manifest(src)
-	if err != nil {
-		err = fmt.Errorf("error generating manifest for tool %q: %w", toolName, err)
+	toolManifest, mErr := tool.Manifest(src)
+	if mErr != nil {
+		err = fmt.Errorf("error generating manifest for tool %q: %w", toolName, mErr)
 		s.logger.DebugContext(ctx, err.Error())
 		_ = render.Render(w, r, newErrResponse(err, http.StatusInternalServerError))
 		return
@@ -142,6 +141,10 @@ func toolInvokeHandler(s *Server, w http.ResponseWriter, r *http.Request) {
 	ctx, span := s.instrumentation.Tracer.Start(r.Context(), "toolbox/server/tool/invoke")
 	r = r.WithContext(ctx)
 	ctx = util.WithLogger(r.Context(), s.logger)
+	// Lazy initialization connects the source from this request's context, and
+	// most source drivers refuse to build a client without a user agent. The
+	// MCP transports set it per request; this path has to as well.
+	ctx = util.WithUserAgent(ctx, s.version)
 
 	toolName := chi.URLParam(r, "toolName")
 	s.logger.DebugContext(ctx, fmt.Sprintf("tool name: %s", toolName))
@@ -162,9 +165,8 @@ func toolInvokeHandler(s *Server, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	srcName := tool.GetSourceName()
 	var src sources.Source
-	if srcName != "" {
+	if srcName := tool.GetSourceName(); srcName != "" {
 		src, ok = s.PrimitiveMgr.GetSource(srcName)
 		if !ok {
 			err = fmt.Errorf("unable to retrieve source for tool %s", toolName)

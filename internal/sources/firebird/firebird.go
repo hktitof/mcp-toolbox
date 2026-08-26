@@ -59,29 +59,46 @@ func (r Config) SourceConfigType() string {
 	return SourceType
 }
 
-func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
-	pool, err := initFirebirdConnectionPool(ctx, tracer, r.Name, r.Host, r.Port, r.User, r.Password, r.Database)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create pool: %w", err)
+func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
+	s := r.newSource(ctx, tracer)
+	if lazy {
+		return s, nil
 	}
-
-	err = pool.PingContext(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("unable to connect successfully: %w", err)
-	}
-
-	s := &Source{
-		Config: r,
-		Db:     pool,
+	if _, err := s.pool(ctx); err != nil {
+		return nil, err
 	}
 	return s, nil
+}
+
+func (r Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
+	return &Source{
+		Config: r,
+		tracer: tracer,
+		conn:   sources.NewConnectOnce[*sql.DB](ctx, r.Name, SourceType, tracer),
+	}
 }
 
 var _ sources.Source = &Source{}
 
 type Source struct {
 	Config
-	Db *sql.DB
+	tracer trace.Tracer
+	conn   *sources.ConnectOnce[*sql.DB]
+}
+
+// pool returns the connection pool, creating it on first use.
+func (s *Source) pool(ctx context.Context) (*sql.DB, error) {
+	return s.conn.Do(ctx, func(ctx context.Context) (*sql.DB, error) {
+		pool, err := initFirebirdConnectionPool(ctx, s.tracer, s.Name, s.Host, s.Port, s.User, s.Password, s.Database)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create pool: %w", err)
+		}
+
+		if err := pool.PingContext(ctx); err != nil {
+			return nil, fmt.Errorf("unable to connect successfully: %w", err)
+		}
+		return pool, nil
+	})
 }
 
 func (s *Source) IsReadOnly() bool {
@@ -96,12 +113,19 @@ func (s *Source) ToConfig() sources.SourceConfig {
 	return s.Config
 }
 
+// FirebirdDB reports the connection pool if one has been made. It is the type
+// discriminator tools assert on; a deferred source has not connected yet.
 func (s *Source) FirebirdDB() *sql.DB {
-	return s.Db
+	pool, _ := s.conn.Get()
+	return pool
 }
 
 func (s *Source) RunSQL(ctx context.Context, statement string, params []any) (any, error) {
-	rows, err := s.FirebirdDB().QueryContext(ctx, statement, params...)
+	pool, err := s.pool(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := pool.QueryContext(ctx, statement, params...)
 	if err != nil {
 		return nil, fmt.Errorf("unable to execute query: %w", err)
 	}

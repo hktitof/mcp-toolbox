@@ -100,29 +100,46 @@ func (r Config) SourceConfigType() string {
 	return SourceType
 }
 
-func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
-	db, err := initOracleConnection(ctx, tracer, r)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create Oracle connection: %w", err)
+func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
+	s := r.newSource(ctx, tracer)
+	if lazy {
+		return s, nil
 	}
-
-	err = db.PingContext(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("unable to connect to Oracle successfully: %w", err)
-	}
-
-	s := &Source{
-		Config: r,
-		DB:     db,
+	if _, err := s.pool(ctx); err != nil {
+		return nil, err
 	}
 	return s, nil
+}
+
+func (r Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
+	return &Source{
+		Config: r,
+		tracer: tracer,
+		conn:   sources.NewConnectOnce[*sql.DB](ctx, r.Name, SourceType, tracer),
+	}
 }
 
 var _ sources.Source = &Source{}
 
 type Source struct {
 	Config
-	DB *sql.DB
+	tracer trace.Tracer
+	conn   *sources.ConnectOnce[*sql.DB]
+}
+
+// pool returns the database connection, creating it on first use.
+func (s *Source) pool(ctx context.Context) (*sql.DB, error) {
+	return s.conn.Do(ctx, func(ctx context.Context) (*sql.DB, error) {
+		db, err := initOracleConnection(ctx, s.tracer, s.Config)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create Oracle connection: %w", err)
+		}
+
+		if err := db.PingContext(ctx); err != nil {
+			return nil, fmt.Errorf("unable to connect to Oracle successfully: %w", err)
+		}
+		return db, nil
+	})
 }
 
 func (s *Source) IsReadOnly() bool {
@@ -137,13 +154,20 @@ func (s *Source) ToConfig() sources.SourceConfig {
 	return s.Config
 }
 
+// OracleDB reports the database connection if one has been made. It is the
+// type discriminator tools assert on; a deferred source has not connected yet.
 func (s *Source) OracleDB() *sql.DB {
-	return s.DB
+	db, _ := s.conn.Get()
+	return db
 }
 
 func (s *Source) RunSQL(ctx context.Context, statement string, params []any, readOnly bool) (any, error) {
+	db, err := s.pool(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if !readOnly {
-		result, err := s.OracleDB().ExecContext(ctx, statement, params...)
+		result, err := db.ExecContext(ctx, statement, params...)
 		if err != nil {
 			return nil, fmt.Errorf("unable to execute DML statement: %w", err)
 		}
@@ -158,7 +182,7 @@ func (s *Source) RunSQL(ctx context.Context, statement string, params []any, rea
 			"rows_affected": rowsAffected,
 		}, nil
 	}
-	rows, err := s.OracleDB().QueryContext(ctx, statement, params...)
+	rows, err := db.QueryContext(ctx, statement, params...)
 	if err != nil {
 		return nil, fmt.Errorf("unable to execute query: %w", err)
 	}

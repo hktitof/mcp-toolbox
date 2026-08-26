@@ -64,47 +64,73 @@ func (r Config) SourceConfigType() string {
 	return SourceType
 }
 
-func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
-	ua, err := util.UserAgentFromContext(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("error in User Agent retrieval: %s", err)
+func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
+	s := r.newSource(ctx, tracer)
+	if lazy {
+		return s, nil
 	}
-	endpoint := fmt.Sprintf("%s-dataproc.googleapis.com:443", r.Location)
-	batchClient, err := dataproc.NewBatchControllerClient(ctx, option.WithEndpoint(endpoint), option.WithUserAgent(ua))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create dataproc batch client: %w", err)
-	}
-	sessionTemplateClient, err := dataproc.NewSessionTemplateControllerClient(ctx, option.WithEndpoint(endpoint), option.WithUserAgent(ua))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create dataproc session template client: %w", err)
-	}
-	opsClient, err := longrunning.NewOperationsClient(ctx, option.WithEndpoint(endpoint), option.WithUserAgent(ua))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create longrunning client: %w", err)
-	}
-	sessionClient, err := dataproc.NewSessionControllerClient(ctx, option.WithEndpoint(endpoint), option.WithUserAgent(ua))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create dataproc session client: %w", err)
-	}
-
-	s := &Source{
-		Config:                r,
-		BatchClient:           batchClient,
-		SessionTemplateClient: sessionTemplateClient,
-		OpsClient:             opsClient,
-		SessionClient:         sessionClient,
+	if _, err := s.clients(ctx); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
 
+func (r Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
+	return &Source{
+		Config: r,
+		tracer: tracer,
+		conn:   sources.NewConnectOnce[*clientSet](ctx, r.Name, SourceType, tracer),
+	}
+}
+
 var _ sources.Source = &Source{}
+
+// clientSet groups the handles this source builds in one connect.
+type clientSet struct {
+	batchClient           *dataproc.BatchControllerClient
+	sessionTemplateClient *dataproc.SessionTemplateControllerClient
+	opsClient             *longrunning.OperationsClient
+	sessionClient         *dataproc.SessionControllerClient
+}
 
 type Source struct {
 	Config
-	BatchClient           *dataproc.BatchControllerClient
-	SessionTemplateClient *dataproc.SessionTemplateControllerClient
-	OpsClient             *longrunning.OperationsClient
-	SessionClient         *dataproc.SessionControllerClient
+	tracer trace.Tracer
+	conn   *sources.ConnectOnce[*clientSet]
+}
+
+// clients returns the Dataproc clients, creating them on first use.
+func (s *Source) clients(ctx context.Context) (*clientSet, error) {
+	return s.conn.Do(ctx, func(ctx context.Context) (*clientSet, error) {
+		ua, err := util.UserAgentFromContext(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("error in User Agent retrieval: %s", err)
+		}
+		endpoint := fmt.Sprintf("%s-dataproc.googleapis.com:443", s.Location)
+		batchClient, err := dataproc.NewBatchControllerClient(ctx, option.WithEndpoint(endpoint), option.WithUserAgent(ua))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create dataproc batch client: %w", err)
+		}
+		sessionTemplateClient, err := dataproc.NewSessionTemplateControllerClient(ctx, option.WithEndpoint(endpoint), option.WithUserAgent(ua))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create dataproc session template client: %w", err)
+		}
+		opsClient, err := longrunning.NewOperationsClient(ctx, option.WithEndpoint(endpoint), option.WithUserAgent(ua))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create longrunning client: %w", err)
+		}
+		sessionClient, err := dataproc.NewSessionControllerClient(ctx, option.WithEndpoint(endpoint), option.WithUserAgent(ua))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create dataproc session client: %w", err)
+		}
+
+		return &clientSet{
+			batchClient:           batchClient,
+			sessionTemplateClient: sessionTemplateClient,
+			opsClient:             opsClient,
+			sessionClient:         sessionClient,
+		}, nil
+	})
 }
 
 func (s *Source) IsReadOnly() bool {
@@ -127,24 +153,50 @@ func (s *Source) GetLocation() string {
 	return s.Location
 }
 
+// GetBatchControllerClient reports the batch client if one has been made; a
+// deferred source has not connected yet.
 func (s *Source) GetBatchControllerClient() *dataproc.BatchControllerClient {
-	return s.BatchClient
+	cs, ok := s.conn.Get()
+	if !ok {
+		return nil
+	}
+	return cs.batchClient
 }
 
+// GetSessionTemplateControllerClient reports the session template client if one
+// has been made.
 func (s *Source) GetSessionTemplateControllerClient() *dataproc.SessionTemplateControllerClient {
-	return s.SessionTemplateClient
+	cs, ok := s.conn.Get()
+	if !ok {
+		return nil
+	}
+	return cs.sessionTemplateClient
 }
 
+// GetSessionControllerClient reports the session client if one has been made.
 func (s *Source) GetSessionControllerClient() *dataproc.SessionControllerClient {
-	return s.SessionClient
+	cs, ok := s.conn.Get()
+	if !ok {
+		return nil
+	}
+	return cs.sessionClient
 }
 
 func (s *Source) GetOperationsClient(ctx context.Context) (*longrunning.OperationsClient, error) {
-	return s.OpsClient, nil
+	cs, err := s.clients(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return cs.opsClient, nil
 }
 
+// Close releases the clients if they were ever created.
 func (s *Source) Close() error {
-	return errors.Join(s.BatchClient.Close(), s.SessionClient.Close(), s.SessionTemplateClient.Close(), s.OpsClient.Close())
+	cs, ok := s.conn.Get()
+	if !ok {
+		return nil
+	}
+	return errors.Join(cs.batchClient.Close(), cs.sessionClient.Close(), cs.sessionTemplateClient.Close(), cs.opsClient.Close())
 }
 
 func (s *Source) CancelOperation(ctx context.Context, operation string) (any, error) {
@@ -163,12 +215,17 @@ func (s *Source) CancelOperation(ctx context.Context, operation string) (any, er
 }
 
 func (s *Source) CreateBatch(ctx context.Context, batch *dataprocpb.Batch) (map[string]any, error) {
+	cs, err := s.clients(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	req := &dataprocpb.CreateBatchRequest{
 		Parent: fmt.Sprintf("projects/%s/locations/%s", s.GetProject(), s.GetLocation()),
 		Batch:  batch,
 	}
 
-	client := s.GetBatchControllerClient()
+	client := cs.batchClient
 	op, err := client.CreateBatch(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create batch: %w", err)
@@ -212,7 +269,11 @@ type Batch struct {
 }
 
 func (s *Source) ListBatches(ctx context.Context, ps *int, pt, filter string) (any, error) {
-	client := s.GetBatchControllerClient()
+	cs, err := s.clients(ctx)
+	if err != nil {
+		return nil, err
+	}
+	client := cs.batchClient
 	parent := fmt.Sprintf("projects/%s/locations/%s", s.GetProject(), s.GetLocation())
 	req := &dataprocpb.ListBatchesRequest{
 		Parent:  parent,
@@ -274,7 +335,11 @@ func ToBatches(batchPbs []*dataprocpb.Batch) ([]Batch, error) {
 }
 
 func (s *Source) GetBatch(ctx context.Context, name string) (map[string]any, error) {
-	client := s.GetBatchControllerClient()
+	cs, err := s.clients(ctx)
+	if err != nil {
+		return nil, err
+	}
+	client := cs.batchClient
 	req := &dataprocpb.GetBatchRequest{
 		Name: fmt.Sprintf("projects/%s/locations/%s/batches/%s", s.GetProject(), s.GetLocation(), name),
 	}
@@ -321,7 +386,11 @@ type SessionTemplate struct {
 }
 
 func (s *Source) GetSessionTemplate(ctx context.Context, name string) (map[string]any, error) {
-	client := s.GetSessionTemplateControllerClient()
+	cs, err := s.clients(ctx)
+	if err != nil {
+		return nil, err
+	}
+	client := cs.sessionTemplateClient
 	req := &dataprocpb.GetSessionTemplateRequest{
 		Name: fmt.Sprintf("projects/%s/locations/%s/sessionTemplates/%s", s.GetProject(), s.GetLocation(), name),
 	}
@@ -382,7 +451,11 @@ type Session struct {
 }
 
 func (s *Source) ListSessions(ctx context.Context, ps *int, pt, filter string) (any, error) {
-	client := s.GetSessionControllerClient()
+	cs, err := s.clients(ctx)
+	if err != nil {
+		return nil, err
+	}
+	client := cs.sessionClient
 	parent := fmt.Sprintf("projects/%s/locations/%s", s.GetProject(), s.GetLocation())
 	req := &dataprocpb.ListSessionsRequest{
 		Parent: parent,
@@ -416,7 +489,11 @@ func (s *Source) ListSessions(ctx context.Context, ps *int, pt, filter string) (
 }
 
 func (s *Source) GetSession(ctx context.Context, name string) (map[string]any, error) {
-	client := s.GetSessionControllerClient()
+	cs, err := s.clients(ctx)
+	if err != nil {
+		return nil, err
+	}
+	client := cs.sessionClient
 	req := &dataprocpb.GetSessionRequest{
 		Name: fmt.Sprintf("projects/%s/locations/%s/sessions/%s", s.GetProject(), s.GetLocation(), name),
 	}

@@ -145,6 +145,10 @@ func handleDynamicReload(ctx context.Context, cfg server.ServerConfig, s *server
 		return err
 	}
 
+	// Under lazy initialization sourcesMap holds unconnected sources built from
+	// the reloaded configs, so this single swap is what makes them live. A call
+	// landing either side of it sees one config or the other, never a source
+	// connected from the pre-reload config.
 	s.PrimitiveMgr.SetPrimitives(sourcesMap, authServicesMap, embeddingModelsMap, toolsMap, promptsMap, groupsMap)
 
 	return nil
@@ -359,7 +363,7 @@ func watchChanges(ctx context.Context, watchDirs map[string]bool, watchedFiles m
 			reloadedOpts.Configs = slices.Clone(opts.Configs)
 			reloadedOpts.Cfg.Version = versionString
 
-			if _, err := reloadedOpts.LoadConfig(ctx, &internal.ConfigParser{}); err != nil {
+			if _, err := reloadedOpts.LoadConfig(ctx, &internal.ConfigParser{AllowMissingEnvVars: opts.Cfg.LazySourceInit}); err != nil {
 				logger.WarnContext(ctx, fmt.Sprintf("Error reloading config: %s", err))
 				continue
 			}
@@ -431,9 +435,19 @@ func run(cmd *cobra.Command, opts *internal.ToolboxOptions) error {
 		_ = shutdown(ctx)
 	}()
 
-	isCustomConfigured, err := opts.LoadConfig(ctx, &internal.ConfigParser{})
+	// Lazy initialization never connects during parsing, so source env vars only
+	// need to satisfy validation. Letting unset ones resolve to a placeholder is
+	// what makes --lazy-source-init sufficient on its own to inspect a catalog.
+	parser := internal.ConfigParser{AllowMissingEnvVars: opts.Cfg.LazySourceInit}
+	isCustomConfigured, err := opts.LoadConfig(ctx, &parser)
 	if err != nil {
 		return err
+	}
+	if len(parser.MissingEnvVars) > 0 {
+		slices.Sort(parser.MissingEnvVars)
+		opts.Logger.WarnContext(ctx, fmt.Sprintf(
+			"Unset environment variables replaced with placeholders because --lazy-source-init is set; any source using them will fail to connect: %s",
+			strings.Join(parser.MissingEnvVars, ", ")))
 	}
 
 	// Validate ToolboxUrl if MCP Auth is enabled

@@ -64,31 +64,48 @@ func (r Config) SourceConfigType() string {
 	return SourceType
 }
 
-func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
+func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
 	// Initializes a MSSQL source
-	db, err := initMssqlConnection(ctx, tracer, r.Name, r.Host, r.Port, r.User, r.Password, r.Database, r.Encrypt)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create db connection: %w", err)
+	s := r.newSource(ctx, tracer)
+	if lazy {
+		return s, nil
 	}
-
-	// Verify db connection
-	err = db.PingContext(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("unable to connect successfully: %w", err)
-	}
-
-	s := &Source{
-		Config: r,
-		Db:     db,
+	if _, err := s.pool(ctx); err != nil {
+		return nil, err
 	}
 	return s, nil
+}
+
+func (r Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
+	return &Source{
+		Config: r,
+		tracer: tracer,
+		conn:   sources.NewConnectOnce[*sql.DB](ctx, r.Name, SourceType, tracer),
+	}
 }
 
 var _ sources.Source = &Source{}
 
 type Source struct {
 	Config
-	Db *sql.DB
+	tracer trace.Tracer
+	conn   *sources.ConnectOnce[*sql.DB]
+}
+
+// pool returns the connection pool, creating it on first use.
+func (s *Source) pool(ctx context.Context) (*sql.DB, error) {
+	return s.conn.Do(ctx, func(ctx context.Context) (*sql.DB, error) {
+		db, err := initMssqlConnection(ctx, s.tracer, s.Name, s.Host, s.Port, s.User, s.Password, s.Database, s.Encrypt)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create db connection: %w", err)
+		}
+
+		// Verify db connection
+		if err := db.PingContext(ctx); err != nil {
+			return nil, fmt.Errorf("unable to connect successfully: %w", err)
+		}
+		return db, nil
+	})
 }
 
 func (s *Source) IsReadOnly() bool {
@@ -104,13 +121,19 @@ func (s *Source) ToConfig() sources.SourceConfig {
 	return s.Config
 }
 
+// MSSQLDB reports the database connection pool if one has been made. It is the
+// type discriminator tools assert on; a deferred source has not connected yet.
 func (s *Source) MSSQLDB() *sql.DB {
-	// Returns a Cloud SQL MSSQL database connection pool
-	return s.Db
+	db, _ := s.conn.Get()
+	return db
 }
 
 func (s *Source) RunSQL(ctx context.Context, statement string, params []any) (any, error) {
-	results, err := s.MSSQLDB().QueryContext(ctx, statement, params...)
+	db, err := s.pool(ctx)
+	if err != nil {
+		return nil, err
+	}
+	results, err := db.QueryContext(ctx, statement, params...)
 	if err != nil {
 		return nil, fmt.Errorf("unable to execute query: %w", err)
 	}

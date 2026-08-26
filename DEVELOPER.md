@@ -218,9 +218,13 @@ implementation](https://github.com/googleapis/mcp-toolbox/blob/main/internal/sou
   interface**. This interface requires two methods:
   * `SourceConfigType() string`: Returns a unique string identifier for your
     data source (e.g., `"newdb"`).
-  * `Initialize(ctx context.Context, tracer trace.Tracer) (Source, error)`:
-    Creates a new instance of your data source and establishes a connection to
-    the database.
+  * `Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (Source, error)`:
+    Creates a new instance of your data source. When `lazy` is set it must
+    return without connecting, leaving the source to connect on the first call
+    that needs it; hold the connection in a
+    [`sources.ConnectOnce`](https://github.com/googleapis/mcp-toolbox/blob/main/internal/sources/connect.go)
+    and resolve it through `Do`. Otherwise it connects before returning and
+    reports a failed connection as an error.
 * **Implement the
   [`Source`](https://github.com/googleapis/mcp-toolbox/blob/fd300dc606d88bf9f7bba689e2cee4e3565537dd/internal/sources/sources.go#L63)
   interface**. This interface requires one method:

@@ -57,38 +57,64 @@ func (r Config) SourceConfigType() string {
 	return SourceType
 }
 
-func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
-	client, err := initBigtableClient(ctx, tracer, r.Name, r.Project, r.Instance)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create client: %w", err)
+func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
+	s := r.newSource(ctx, tracer)
+	if lazy {
+		return s, nil
 	}
-
-	instanceAdminClient, err := initBigtableInstanceAdminClient(ctx, tracer, r.Name, r.Project)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create instance admin client: %w", err)
-	}
-
-	adminClient, err := initBigtableAdminClient(ctx, tracer, r.Name, r.Project, r.Instance)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create admin client: %w", err)
-	}
-
-	s := &Source{
-		Config:        r,
-		Client:        client,
-		InstanceAdmin: instanceAdminClient,
-		Admin:         adminClient,
+	if _, err := s.clients(ctx); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
 
+func (r Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
+	return &Source{
+		Config: r,
+		tracer: tracer,
+		conn:   sources.NewConnectOnce[*clientSet](ctx, r.Name, SourceType, tracer),
+	}
+}
+
 var _ sources.Source = &Source{}
+
+// clientSet groups the handles this source builds in one connect.
+type clientSet struct {
+	client        *bigtable.Client
+	instanceAdmin *bigtable.InstanceAdminClient
+	admin         *bigtable.AdminClient
+}
 
 type Source struct {
 	Config
-	Client        *bigtable.Client
-	InstanceAdmin *bigtable.InstanceAdminClient
-	Admin         *bigtable.AdminClient
+	tracer trace.Tracer
+	conn   *sources.ConnectOnce[*clientSet]
+}
+
+// clients returns the Bigtable clients, creating them on first use.
+func (s *Source) clients(ctx context.Context) (*clientSet, error) {
+	return s.conn.Do(ctx, func(ctx context.Context) (*clientSet, error) {
+		client, err := initBigtableClient(ctx, s.tracer, s.Name, s.Project, s.Instance)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create client: %w", err)
+		}
+
+		instanceAdminClient, err := initBigtableInstanceAdminClient(ctx, s.tracer, s.Name, s.Project)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create instance admin client: %w", err)
+		}
+
+		adminClient, err := initBigtableAdminClient(ctx, s.tracer, s.Name, s.Project, s.Instance)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create admin client: %w", err)
+		}
+
+		return &clientSet{
+			client:        client,
+			instanceAdmin: instanceAdminClient,
+			admin:         adminClient,
+		}, nil
+	})
 }
 
 func (s *Source) IsReadOnly() bool {
@@ -103,16 +129,33 @@ func (s *Source) ToConfig() sources.SourceConfig {
 	return s.Config
 }
 
+// BigtableClient reports the data client if one has been made. It is the type
+// discriminator tools assert on; a deferred source has not connected yet.
 func (s *Source) BigtableClient() *bigtable.Client {
-	return s.Client
+	cs, ok := s.conn.Get()
+	if !ok {
+		return nil
+	}
+	return cs.client
 }
 
+// BigtableInstanceAdminClient reports the instance admin client if one has been
+// made.
 func (s *Source) BigtableInstanceAdminClient() *bigtable.InstanceAdminClient {
-	return s.InstanceAdmin
+	cs, ok := s.conn.Get()
+	if !ok {
+		return nil
+	}
+	return cs.instanceAdmin
 }
 
+// BigtableAdminClient reports the admin client if one has been made.
 func (s *Source) BigtableAdminClient() *bigtable.AdminClient {
-	return s.Admin
+	cs, ok := s.conn.Get()
+	if !ok {
+		return nil
+	}
+	return cs.admin
 }
 
 func (s *Source) ProjectID() string {
@@ -163,12 +206,17 @@ func getMapParamsType(tparams parameters.Parameters) (map[string]bigtable.SQLTyp
 }
 
 func (s *Source) RunSQL(ctx context.Context, statement string, configParam parameters.Parameters, params parameters.ParamValues) (any, error) {
+	cs, err := s.clients(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	mapParamsType, err := getMapParamsType(configParam)
 	if err != nil {
 		return nil, fmt.Errorf("fail to get map params: %w", err)
 	}
 
-	ps, err := s.BigtableClient().PrepareStatement(
+	ps, err := cs.client.PrepareStatement(
 		ctx,
 		statement,
 		mapParamsType,

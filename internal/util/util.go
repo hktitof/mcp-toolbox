@@ -121,6 +121,13 @@ func WithUserAgent(ctx context.Context, versionString string) context.Context {
 	return context.WithValue(ctx, userAgentKey, userAgent)
 }
 
+// WithUserAgentValue stores an already-formatted user agent verbatim. Use it to
+// carry a user agent captured from another context; WithUserAgent is for
+// building one from a version string.
+func WithUserAgentValue(ctx context.Context, userAgent string) context.Context {
+	return context.WithValue(ctx, userAgentKey, userAgent)
+}
+
 // UserAgentFromContext retrieves the user agent or return an error
 func UserAgentFromContext(ctx context.Context) (string, error) {
 	if ua := ctx.Value(userAgentKey); ua != nil {

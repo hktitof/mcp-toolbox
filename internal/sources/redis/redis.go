@@ -73,16 +73,22 @@ type RedisClient interface {
 var _ RedisClient = (*redis.Client)(nil)
 var _ RedisClient = (*redis.ClusterClient)(nil)
 
-func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
-	client, err := initRedisClient(ctx, r)
-	if err != nil {
-		return nil, fmt.Errorf("error initializing Redis client: %s", err)
+func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
+	s := r.newSource(ctx, tracer)
+	if lazy {
+		return s, nil
 	}
-	s := &Source{
-		Config: r,
-		Client: client,
+	if _, err := s.client(ctx); err != nil {
+		return nil, err
 	}
 	return s, nil
+}
+
+func (r Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
+	return &Source{
+		Config: r,
+		conn:   sources.NewConnectOnce[RedisClient](ctx, r.Name, SourceType, tracer),
+	}
 }
 
 func initRedisClient(ctx context.Context, r Config) (RedisClient, error) {
@@ -152,9 +158,23 @@ func initRedisClient(ctx context.Context, r Config) (RedisClient, error) {
 
 var _ sources.Source = &Source{}
 
+// Source holds the config and, once made, the client. initRedisClient takes no
+// tracer, so unlike other sources there is no tracer field: ConnectOnce owns
+// the span for the connect.
 type Source struct {
 	Config
-	Client RedisClient
+	conn *sources.ConnectOnce[RedisClient]
+}
+
+// client returns the Redis client, creating it on first use.
+func (s *Source) client(ctx context.Context) (RedisClient, error) {
+	return s.conn.Do(ctx, func(ctx context.Context) (RedisClient, error) {
+		client, err := initRedisClient(ctx, s.Config)
+		if err != nil {
+			return nil, fmt.Errorf("error initializing Redis client: %s", err)
+		}
+		return client, nil
+	})
 }
 
 func (s *Source) IsReadOnly() bool {
@@ -169,15 +189,23 @@ func (s *Source) ToConfig() sources.SourceConfig {
 	return s.Config
 }
 
+// RedisClient reports the client if one has been made. It is the type
+// discriminator tools assert on; a deferred source has not connected yet, so
+// callers inside this package resolve through client instead.
 func (s *Source) RedisClient() RedisClient {
-	return s.Client
+	client, _ := s.conn.Get()
+	return client
 }
 
 func (s *Source) RunCommand(ctx context.Context, cmds [][]any) (any, error) {
+	client, err := s.client(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// Execute commands
 	responses := make([]*redis.Cmd, len(cmds))
 	for i, cmd := range cmds {
-		responses[i] = s.RedisClient().Do(ctx, cmd...)
+		responses[i] = client.Do(ctx, cmd...)
 	}
 	// Parse responses
 	out := make([]any, len(cmds))

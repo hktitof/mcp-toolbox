@@ -79,28 +79,47 @@ func (r Config) SourceConfigType() string {
 	return SourceType
 }
 
-func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
-	hc, err := initDgraphHttpClient(ctx, tracer, r)
-	if err != nil {
-		return nil, err
+func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
+	s := r.newSource(ctx, tracer)
+	if lazy {
+		return s, nil
 	}
-
-	if err := hc.healthCheck(); err != nil {
+	if _, err := s.client(ctx); err != nil {
 		return nil, err
-	}
-
-	s := &Source{
-		Config: r,
-		Client: hc,
 	}
 	return s, nil
+}
+
+func (r Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
+	return &Source{
+		Config: r,
+		tracer: tracer,
+		conn:   sources.NewConnectOnce[*DgraphClient](ctx, r.Name, SourceType, tracer),
+	}
 }
 
 var _ sources.Source = &Source{}
 
 type Source struct {
 	Config
-	Client *DgraphClient `yaml:"client"`
+	tracer trace.Tracer
+	conn   *sources.ConnectOnce[*DgraphClient]
+}
+
+// client returns the Dgraph client, creating and health-checking it on first
+// use.
+func (s *Source) client(ctx context.Context) (*DgraphClient, error) {
+	return s.conn.Do(ctx, func(ctx context.Context) (*DgraphClient, error) {
+		hc, err := initDgraphHttpClient(ctx, s.tracer, s.Config)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := hc.healthCheck(); err != nil {
+			return nil, err
+		}
+		return hc, nil
+	})
 }
 
 func (s *Source) IsReadOnly() bool {
@@ -115,13 +134,22 @@ func (s *Source) ToConfig() sources.SourceConfig {
 	return s.Config
 }
 
+// DgraphClient reports the client if one has been made. It is the type
+// discriminator tools assert on; a deferred source has not connected yet, so
+// callers inside this package resolve through client instead.
 func (s *Source) DgraphClient() *DgraphClient {
-	return s.Client
+	client, _ := s.conn.Get()
+	return client
 }
 
-func (s *Source) RunSQL(statement string, params parameters.ParamValues, isQuery bool, timeout string) (any, error) {
+func (s *Source) RunSQL(ctx context.Context, statement string, params parameters.ParamValues, isQuery bool, timeout string) (any, error) {
+	client, err := s.client(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	paramsMap := params.AsMapWithDollarPrefix()
-	resp, err := s.DgraphClient().ExecuteQuery(statement, paramsMap, isQuery, timeout)
+	resp, err := client.ExecuteQuery(statement, paramsMap, isQuery, timeout)
 	if err != nil {
 		return nil, err
 	}

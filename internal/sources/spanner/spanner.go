@@ -63,39 +63,59 @@ func (r Config) SourceConfigType() string {
 	return SourceType
 }
 
-func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
-	client, err := initSpannerClient(ctx, tracer, r.Name, r.Project, r.Instance, r.Database)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create client: %w", err)
+func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
+	s := r.newSource(ctx, tracer)
+	if lazy {
+		return s, nil
 	}
+	if _, err := s.client(ctx); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
 
+func (r Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
 	onDataplexEvict := func(key string, value interface{}) {
 		if client, ok := value.(*dataplexapi.CatalogClient); ok && client != nil {
 			client.Close()
 		}
 	}
 
-	s := &Source{
+	return &Source{
 		Config: r,
-		Client: client,
+		tracer: tracer,
+		conn:   sources.NewConnectOnce[*spanner.Client](ctx, r.Name, SourceType, tracer),
+		// The Dataplex manager builds nothing until a catalog call arrives, so
+		// it costs nothing to hold on an unconnected source.
 		dataplexMgr: &searchcatalog.DataplexClientManager{
 			UseClientOAuth: r.UseClientOAuth,
 			Cache:          sources.NewCache(onDataplexEvict),
 		},
 	}
-	return s, nil
 }
 
 var _ sources.Source = &Source{}
 
 type Source struct {
 	Config
-	Client      *spanner.Client
+	tracer      trace.Tracer
+	conn        *sources.ConnectOnce[*spanner.Client]
 	dataplexMgr *searchcatalog.DataplexClientManager
 }
 
 func (s *Source) IsReadOnly() bool {
 	return false
+}
+
+// client returns the Spanner client, creating it on first use.
+func (s *Source) client(ctx context.Context) (*spanner.Client, error) {
+	return s.conn.Do(ctx, func(ctx context.Context) (*spanner.Client, error) {
+		client, err := initSpannerClient(ctx, s.tracer, s.Name, s.Project, s.Instance, s.Database)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create client: %w", err)
+		}
+		return client, nil
+	})
 }
 
 func (s *Source) SourceType() string {
@@ -106,8 +126,12 @@ func (s *Source) ToConfig() sources.SourceConfig {
 	return s.Config
 }
 
+// SpannerClient reports the client if one has been made. It is the type
+// discriminator the spanner tools assert on; no tool calls it, so a deferred
+// source that has not connected yet reports nil rather than connecting.
 func (s *Source) SpannerClient() *spanner.Client {
-	return s.Client
+	client, _ := s.conn.Get()
+	return client
 }
 
 func (s *Source) DatabaseDialect() string {
@@ -178,11 +202,16 @@ func (s *Source) RunSQL(ctx context.Context, readOnly bool, statement string, pa
 		stmt.Params = params
 	}
 
+	client, err := s.client(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	if readOnly {
-		iter := s.SpannerClient().Single().Query(ctx, stmt)
+		iter := client.Single().Query(ctx, stmt)
 		results, opErr = processRows(iter)
 	} else {
-		_, opErr = s.SpannerClient().ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		_, opErr = client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 			iter := txn.Query(ctx, stmt)
 			results, err = processRows(iter)
 			if err != nil {

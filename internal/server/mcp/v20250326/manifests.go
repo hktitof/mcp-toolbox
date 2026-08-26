@@ -109,9 +109,8 @@ func GenerateListToolsResult(pMgr *primitives.PrimitiveManager, g group.Group, u
 		if tool.HasSecureParams() {
 			continue
 		}
-		srcName := tool.GetSourceName()
 		var src sources.Source
-		if srcName != "" {
+		if srcName := tool.GetSourceName(); srcName != "" {
 			src, ok = pMgr.GetSource(srcName)
 			if !ok {
 				return ListToolsResult{}, fmt.Errorf("unable to retrieve %s source for tool %q", srcName, tool.GetName())

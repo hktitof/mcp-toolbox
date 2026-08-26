@@ -58,29 +58,48 @@ func (r Config) SourceConfigType() string {
 	return SourceType
 }
 
-func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
-	db, err := initSQLiteConnection(ctx, tracer, r.Name, r.Database)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create db connection: %w", err)
+func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
+	s := r.newSource(ctx, tracer)
+	if lazy {
+		return s, nil
 	}
-
-	err = db.PingContext(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("unable to connect successfully: %w", err)
-	}
-
-	s := &Source{
-		Config: r,
-		Db:     db,
+	if _, err := s.pool(ctx); err != nil {
+		return nil, err
 	}
 	return s, nil
+}
+
+func (r Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
+	return &Source{
+		Config: r,
+		tracer: tracer,
+		conn:   sources.NewConnectOnce[*sql.DB](ctx, r.Name, SourceType, tracer),
+	}
 }
 
 var _ sources.Source = &Source{}
 
 type Source struct {
 	Config
-	Db *sql.DB
+	tracer trace.Tracer
+	conn   *sources.ConnectOnce[*sql.DB]
+}
+
+// pool returns the database handle, opening the file on first use.
+func (s *Source) pool(ctx context.Context) (*sql.DB, error) {
+	return s.conn.Do(ctx, func(ctx context.Context) (*sql.DB, error) {
+		db, err := initSQLiteConnection(ctx, s.tracer, s.Name, s.Database)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create db connection: %w", err)
+		}
+
+		// Opening a local file does not take a deadline; keep the ping
+		// uncancelled so behavior matches eager initialization exactly.
+		if err := db.PingContext(context.Background()); err != nil {
+			return nil, fmt.Errorf("unable to connect successfully: %w", err)
+		}
+		return db, nil
+	})
 }
 
 func (s *Source) IsReadOnly() bool {
@@ -95,14 +114,21 @@ func (s *Source) ToConfig() sources.SourceConfig {
 	return s.Config
 }
 
+// SQLiteDB reports the database handle if one has been opened. It is the type
+// discriminator tools assert on; a deferred source has not opened one yet.
 func (s *Source) SQLiteDB() *sql.DB {
-	return s.Db
+	db, _ := s.conn.Get()
+	return db
 }
 
 func (s *Source) RunSQL(ctx context.Context, statement string, params []any) (any, error) {
+	db, err := s.pool(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// Execute the SQL query with parameters
 	statement = sqlcommenter.PrependComment(ctx, statement, SourceType, s.SQLCommenter)
-	rows, err := s.SQLiteDB().QueryContext(ctx, statement, params...)
+	rows, err := db.QueryContext(ctx, statement, params...)
 	if err != nil {
 		return nil, fmt.Errorf("unable to execute query: %w", err)
 	}

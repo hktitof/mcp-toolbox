@@ -130,9 +130,9 @@ func (g Group) ContainsPrompt(name string) bool {
 }
 
 // ToolsetManifest builds a tools.ToolsetManifest for the group's tools, resolving
-// each declared tool name against toolsMap and generating its manifest from srcs.
-// The group holds tool names rather than tool pointers, so callers pass the
-// resolved tools and sources maps.
+// each declared tool name against mgr and generating its manifest from mgr's
+// sources. The group holds tool names rather than tool pointers, so callers pass
+// the manager rather than the resolved primitives.
 func (g Group) ToolsetManifest(serverVersion string, mgr GroupManager) (tools.ToolsetManifest, error) {
 	toolsManifest := make(map[string]tools.Manifest, len(g.ToolNames))
 	for _, name := range g.ToolNames {
@@ -140,9 +140,8 @@ func (g Group) ToolsetManifest(serverVersion string, mgr GroupManager) (tools.To
 		if !ok {
 			return tools.ToolsetManifest{}, fmt.Errorf("tool does not exist: %s", name)
 		}
-		srcName := tool.GetSourceName()
 		var src sources.Source
-		if srcName != "" {
+		if srcName := tool.GetSourceName(); srcName != "" {
 			src, ok = mgr.GetSource(srcName)
 			if !ok {
 				return tools.ToolsetManifest{}, fmt.Errorf("unable to retrieve %s source for tool %q", srcName, name)

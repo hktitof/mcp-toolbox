@@ -218,6 +218,13 @@ func TestServerConfigFlags(t *testing.T) {
 			}),
 		},
 		{
+			desc: "lazy source init",
+			args: []string{"--lazy-source-init"},
+			want: withDefaults(server.ServerConfig{
+				LazySourceInit: true,
+			}),
+		},
+		{
 			desc: "allowed origin",
 			args: []string{"--allowed-origins", "http://foo.com,http://bar.com"},
 			want: withDefaults(server.ServerConfig{

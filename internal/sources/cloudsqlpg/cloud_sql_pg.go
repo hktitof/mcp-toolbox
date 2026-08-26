@@ -66,37 +66,55 @@ func (r Config) SourceConfigType() string {
 	return SourceType
 }
 
-func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
-	pool, err := initCloudSQLPgConnectionPool(ctx, tracer, r.Name, r.Project, r.Region, r.Instance, r.IPType.String(), r.User, r.Password, r.Database, r.ReadOnly)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create pool: %w", err)
+func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
+	s := r.newSource(ctx, tracer)
+	if lazy {
+		return s, nil
 	}
-
-	err = pool.Ping(ctx)
-	if err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("unable to connect successfully: %w", err)
-	}
-
-	var res int
-	err = pool.QueryRow(ctx, "SELECT 1").Scan(&res)
-	if err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("failed to execute 'SELECT 1' after connection: %w", err)
-	}
-
-	s := &Source{
-		Config: r,
-		Pool:   pool,
+	if _, err := s.pool(ctx); err != nil {
+		return nil, err
 	}
 	return s, nil
+}
+
+func (r Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
+	return &Source{
+		Config: r,
+		tracer: tracer,
+		conn:   sources.NewConnectOnce[*pgxpool.Pool](ctx, r.Name, SourceType, tracer),
+	}
 }
 
 var _ sources.Source = &Source{}
 
 type Source struct {
 	Config
-	Pool *pgxpool.Pool
+	tracer trace.Tracer
+	conn   *sources.ConnectOnce[*pgxpool.Pool]
+}
+
+// pool returns the connection pool, creating it on first use.
+func (s *Source) pool(ctx context.Context) (*pgxpool.Pool, error) {
+	return s.conn.Do(ctx, func(ctx context.Context) (*pgxpool.Pool, error) {
+		pool, err := initCloudSQLPgConnectionPool(ctx, s.tracer, s.Name, s.Project, s.Region, s.Instance, s.IPType.String(), s.User, s.Password, s.Database, s.ReadOnly)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create pool: %w", err)
+		}
+
+		err = pool.Ping(ctx)
+		if err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("unable to connect successfully: %w", err)
+		}
+
+		var res int
+		err = pool.QueryRow(ctx, "SELECT 1").Scan(&res)
+		if err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("failed to execute 'SELECT 1' after connection: %w", err)
+		}
+		return pool, nil
+	})
 }
 
 func (s *Source) IsReadOnly() bool {
@@ -111,13 +129,26 @@ func (s *Source) ToConfig() sources.SourceConfig {
 	return s.Config
 }
 
+// PostgresPool reports the pool if one has been made. It is the type
+// discriminator tools assert on; callers that need a guaranteed-live pool must
+// use PostgresPoolContext, since a deferred source has not connected yet.
 func (s *Source) PostgresPool() *pgxpool.Pool {
-	return s.Pool
+	pool, _ := s.conn.Get()
+	return pool
+}
+
+// PostgresPoolContext returns the pool, connecting on first use.
+func (s *Source) PostgresPoolContext(ctx context.Context) (*pgxpool.Pool, error) {
+	return s.pool(ctx)
 }
 
 func (s *Source) RunSQL(ctx context.Context, statement string, params []any) (any, error) {
+	pool, err := s.pool(ctx)
+	if err != nil {
+		return nil, err
+	}
 	statement = sqlcommenter.PrependComment(ctx, statement, SourceType, s.SQLCommenter)
-	results, err := s.PostgresPool().Query(ctx, statement, params...)
+	results, err := pool.Query(ctx, statement, params...)
 	if err != nil {
 		return nil, fmt.Errorf("unable to execute query: %w", err)
 	}

@@ -2835,3 +2835,31 @@ statement: SELECT 1
 		})
 	}
 }
+
+func TestParseEnvRecordsMissingEnvVars(t *testing.T) {
+	// Under --lazy-source-init unset variables become placeholders so the config
+	// parses. Recording their names is what lets the server warn instead of
+	// silently treating "DB_PASSWORD" as a password.
+	parser := &ConfigParser{AllowMissingEnvVars: true}
+	got, err := parser.parseEnv("user: ${DB_USER}, password: ${DB_PASSWORD}, again: ${DB_USER}")
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	want := "user: DB_USER, password: DB_PASSWORD, again: DB_USER"
+	if got != want {
+		t.Fatalf("unexpected substitution: got %q, want %q", got, want)
+	}
+	if diff := cmp.Diff([]string{"DB_USER", "DB_PASSWORD"}, parser.MissingEnvVars); diff != "" {
+		t.Errorf("MissingEnvVars mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestParseEnvMissingEnvVarsEmptyWhenStrict(t *testing.T) {
+	parser := &ConfigParser{}
+	if _, err := parser.parseEnv("password: ${DB_PASSWORD}"); err == nil {
+		t.Fatal("expected an error for an unset variable in strict mode")
+	}
+	if len(parser.MissingEnvVars) != 0 {
+		t.Fatalf("strict mode must not record substitutions, got %v", parser.MissingEnvVars)
+	}
+}

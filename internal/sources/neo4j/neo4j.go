@@ -63,32 +63,49 @@ func (r Config) SourceConfigType() string {
 	return SourceType
 }
 
-func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
-	driver, err := initNeo4jDriver(ctx, tracer, r.Uri, r.User, r.Password, r.Name)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create driver: %w", err)
+func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
+	s := r.newSource(ctx, tracer)
+	if lazy {
+		return s, nil
 	}
-
-	err = driver.VerifyConnectivity(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("unable to connect successfully: %w", err)
+	if _, err := s.driver(ctx); err != nil {
+		return nil, err
 	}
+	return s, nil
+}
 
+func (r Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
 	if r.Database == "" {
 		r.Database = "neo4j"
 	}
-	s := &Source{
+	return &Source{
 		Config: r,
-		Driver: driver,
+		tracer: tracer,
+		conn:   sources.NewConnectOnce[neo4j.Driver](ctx, r.Name, SourceType, tracer),
 	}
-	return s, nil
 }
 
 var _ sources.Source = &Source{}
 
 type Source struct {
 	Config
-	Driver neo4j.Driver
+	tracer trace.Tracer
+	conn   *sources.ConnectOnce[neo4j.Driver]
+}
+
+// driver returns the Neo4j driver, creating and verifying it on first use.
+func (s *Source) driver(ctx context.Context) (neo4j.Driver, error) {
+	return s.conn.Do(ctx, func(ctx context.Context) (neo4j.Driver, error) {
+		driver, err := initNeo4jDriver(ctx, s.tracer, s.Uri, s.User, s.Password, s.Name)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create driver: %w", err)
+		}
+
+		if err := driver.VerifyConnectivity(ctx); err != nil {
+			return nil, fmt.Errorf("unable to connect successfully: %w", err)
+		}
+		return driver, nil
+	})
 }
 
 func (s *Source) IsReadOnly() bool {
@@ -103,8 +120,17 @@ func (s *Source) ToConfig() sources.SourceConfig {
 	return s.Config
 }
 
+// Neo4jDriver reports the driver if one has been made. It is the type
+// discriminator tools assert on; callers that need a guaranteed-live driver
+// must use Neo4jDriverContext, since a deferred source has not connected yet.
 func (s *Source) Neo4jDriver() neo4j.Driver {
-	return s.Driver
+	driver, _ := s.conn.Get()
+	return driver
+}
+
+// Neo4jDriverContext returns the driver, connecting on first use.
+func (s *Source) Neo4jDriverContext(ctx context.Context) (neo4j.Driver, error) {
+	return s.driver(ctx)
 }
 
 func (s *Source) Neo4jDatabase() string {
@@ -127,8 +153,13 @@ func (s *Source) RunQuery(ctx context.Context, cypherStr string, params map[stri
 		cypherStr = "EXPLAIN " + cypherStr
 	}
 
+	driver, err := s.driver(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	config := neo4j.ExecuteQueryWithDatabase(s.Neo4jDatabase())
-	results, err := neo4j.ExecuteQuery[*neo4j.EagerResult](ctx, s.Neo4jDriver(), cypherStr, params,
+	results, err := neo4j.ExecuteQuery[*neo4j.EagerResult](ctx, driver, cypherStr, params,
 		neo4j.EagerResultTransformer, config)
 	if err != nil {
 		return nil, fmt.Errorf("unable to execute query: %w", err)

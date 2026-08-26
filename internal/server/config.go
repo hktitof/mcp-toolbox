@@ -105,6 +105,8 @@ type ServerConfig struct {
 	SkipSourceValidation bool
 	// DisableExt specifies MCP extension URIs disabled on this server.
 	DisableExt []string
+	// LazySourceInit connects each source on first use instead of at startup.
+	LazySourceInit bool
 }
 
 type logFormat string

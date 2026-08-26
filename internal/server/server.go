@@ -104,8 +104,14 @@ func InitializeConfigs(ctx context.Context, cfg ServerConfig) (
 
 	// initialize and validate the sources from configs
 	sourcesMap := make(map[string]sources.Source)
+	var names []string
 	for name, sc := range cfg.SourceConfigs {
 		s, err := func() (sources.Source, error) {
+			// A lazily initialized source builds without connecting, so it
+			// needs no span here; the connect emits its own when it happens.
+			if cfg.LazySourceInit {
+				return sc.Initialize(ctx, instrumentation.Tracer, true)
+			}
 			childCtx, span := instrumentation.Tracer.Start(
 				ctx,
 				"toolbox/server/source/init",
@@ -113,22 +119,22 @@ func InitializeConfigs(ctx context.Context, cfg ServerConfig) (
 				trace.WithAttributes(attribute.String("source_name", name)),
 			)
 			defer span.End()
-			s, err := sc.Initialize(childCtx, instrumentation.Tracer)
-			if err != nil {
-				return nil, fmt.Errorf("unable to initialize source %q: %w", name, err)
-			}
-			return s, nil
+			return sc.Initialize(childCtx, instrumentation.Tracer, false)
 		}()
 		if err != nil {
-			return nil, nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, fmt.Errorf("unable to initialize source %q: %w", name, err)
 		}
 		sourcesMap[name] = s
+		names = append(names, name)
 	}
-	sourceNames := make([]string, 0, len(sourcesMap))
-	for name := range sourcesMap {
-		sourceNames = append(sourceNames, name)
+	if len(names) > 0 {
+		if cfg.LazySourceInit {
+			l.InfoContext(ctx, fmt.Sprintf("Deferred initialization of %d sources, each connects on first use: %s",
+				len(names), strings.Join(names, ", ")))
+		} else {
+			l.InfoContext(ctx, fmt.Sprintf("Initialized %d sources: %s", len(names), strings.Join(names, ", ")))
+		}
 	}
-	l.InfoContext(ctx, fmt.Sprintf("Initialized %d sources: %s", len(sourcesMap), strings.Join(sourceNames, ", ")))
 
 	// initialize and validate the auth services from configs
 	authServicesMap := make(map[string]auth.AuthService)
@@ -297,6 +303,9 @@ func initializeTools(ctx context.Context, cfg ServerConfig, sourcesMap map[strin
 			}
 
 			if !cfg.SkipSourceValidation {
+				// A deferred source is still its own concrete type, only without
+				// a connection, so compatibility is asserted here exactly as it
+				// was before the flag existed.
 				err = t.ValidateSource(src)
 				if err != nil {
 					return nil, err

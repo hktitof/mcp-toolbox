@@ -182,9 +182,8 @@ func toolsCallHandler(ctx context.Context, id jsonrpc.RequestId, g group.Group, 
 		return jsonrpc.NewError(id, jsonrpc.INVALID_PARAMS, err.Error(), nil), err
 	}
 
-	srcName := tool.GetSourceName()
 	var src sources.Source
-	if srcName != "" {
+	if srcName := tool.GetSourceName(); srcName != "" {
 		src, ok = primitiveMgr.GetSource(srcName)
 		if !ok {
 			err = fmt.Errorf("unable to retrieve source for tool %s", toolName)

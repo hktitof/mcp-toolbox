@@ -34,10 +34,12 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/googleapis/mcp-toolbox/internal/auth"
 	"github.com/googleapis/mcp-toolbox/internal/auth/generic"
 	"github.com/googleapis/mcp-toolbox/internal/embeddingmodels"
@@ -432,7 +434,7 @@ func TestUpdateServer(t *testing.T) {
 	}
 
 	gotSource, _ := s.PrimitiveMgr.GetSource("example-source")
-	if diff := cmp.Diff(gotSource, newSources["example-source"]); diff != "" {
+	if diff := cmp.Diff(gotSource, newSources["example-source"], cmpopts.IgnoreUnexported(alloydbpg.Source{})); diff != "" {
 		t.Errorf("error updating server, sources (-want +got):\n%s", diff)
 	}
 
@@ -1864,7 +1866,7 @@ func TestInitializeConfigs(t *testing.T) {
 	ctx = util.WithInstrumentation(ctx, instrumentation)
 	t.Run("valid initialization", func(t *testing.T) {
 		sourceConfig1 := testutils.MockSourceConfig{Name: "my-source", Type: "mock-source"}
-		source1, _ := sourceConfig1.Initialize(ctx, nil)
+		source1, _ := sourceConfig1.Initialize(ctx, nil, false)
 		tools1 := testutils.NewMockTool("my-tool", "mock tool for offline config", "my-source", nil, false, false)
 		validCfg := server.ServerConfig{
 			Version: "0.0.0",
@@ -1886,6 +1888,78 @@ func TestInitializeConfigs(t *testing.T) {
 		}
 		if !reflect.DeepEqual(toolsMap, wantToolsMap) {
 			t.Fatalf("tools map mismatch: want %s, got %s", wantToolsMap, toolsMap)
+		}
+	})
+	t.Run("lazy source initialization defers the connection", func(t *testing.T) {
+		tool1 := testutils.NewMockTool("my-tool", "mock tool", "my-source", nil, false, false)
+		var connects atomic.Int32
+		cfg := server.ServerConfig{
+			Version: "0.0.0",
+			SourceConfigs: server.SourceConfigs{
+				"my-source": testutils.MockCountingSourceConfig{
+					MockSourceConfig: testutils.MockSourceConfig{Name: "my-source", Type: "mock-source"},
+					Connects:         &connects,
+				},
+			},
+			ToolConfigs: server.ToolConfigs{
+				"my-tool": tool1.ToConfig(),
+			},
+			LazySourceInit: true,
+		}
+		sourcesMap, _, _, toolsMap, _, _, err := server.InitializeConfigs(ctx, cfg)
+		if err != nil {
+			t.Fatalf("unexpected error during config initialization: %s", err)
+		}
+		if got := connects.Load(); got != 0 {
+			t.Fatalf("expected the source not to connect at startup, got %d connections", got)
+		}
+		if _, ok := sourcesMap["my-source"]; !ok || len(sourcesMap) != 1 {
+			t.Fatalf("expected exactly one source in the store, got %v", sourcesMap)
+		}
+		wantToolsMap := map[string]tools.Tool{"my-tool": tool1}
+		if !reflect.DeepEqual(toolsMap, wantToolsMap) {
+			t.Fatalf("tools map mismatch: want %s, got %s", wantToolsMap, toolsMap)
+		}
+	})
+	t.Run("lazy source initialization still validates compatibility", func(t *testing.T) {
+		// A deferred source is still its concrete type, so a tool pointed at an
+		// incompatible one must fail at startup rather than on the first call.
+		tool1 := testutils.NewMockTool("my-tool", "mock tool", "my-source", nil, false, false)
+		cfg := server.ServerConfig{
+			Version: "0.0.0",
+			SourceConfigs: server.SourceConfigs{
+				"my-source": testutils.MockCountingSourceConfig{
+					MockSourceConfig: testutils.MockSourceConfig{Name: "my-source", Type: "invalid-type"},
+				},
+			},
+			ToolConfigs: server.ToolConfigs{
+				"my-tool": tool1.ToConfig(),
+			},
+			LazySourceInit: true,
+		}
+		if _, _, _, _, _, _, err := server.InitializeConfigs(ctx, cfg); err == nil {
+			t.Fatal("expected an incompatible source to fail startup validation")
+		}
+	})
+	t.Run("lazy initialization rejects an unknown source name", func(t *testing.T) {
+		// Deferring connections must not defer catching a typo'd source name.
+		cfg := server.ServerConfig{
+			Version: "0.0.0",
+			SourceConfigs: server.SourceConfigs{
+				"my-source": testutils.MockSourceConfig{Name: "my-source", Type: "mock-source"},
+			},
+			ToolConfigs: server.ToolConfigs{
+				"my-tool": testutils.NewMockTool("my-tool", "mock tool", "typo-source", nil, false, false).ToConfig(),
+			},
+			LazySourceInit: true,
+		}
+		_, _, _, _, _, _, err := server.InitializeConfigs(ctx, cfg)
+		if err == nil {
+			t.Fatal("expected an error for a tool naming an unconfigured source")
+		}
+		wantErr := `unable to retrieve source "typo-source" for tool "my-tool"`
+		if err.Error() != wantErr {
+			t.Fatalf("unexpected error: want %s, got %s", wantErr, err.Error())
 		}
 	})
 	t.Run("invalid initialization", func(t *testing.T) {

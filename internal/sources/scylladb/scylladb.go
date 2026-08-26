@@ -67,16 +67,23 @@ type Config struct {
 }
 
 // Initialize implements sources.SourceConfig.
-func (c Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
-	session, err := initScyllaDBSession(ctx, tracer, c)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create session: %v", err)
+func (c Config) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
+	s := c.newSource(ctx, tracer)
+	if lazy {
+		return s, nil
 	}
-	s := &Source{
-		Config:  c,
-		Session: session,
+	if _, err := s.session(ctx); err != nil {
+		return nil, err
 	}
 	return s, nil
+}
+
+func (c Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
+	return &Source{
+		Config: c,
+		tracer: tracer,
+		conn:   sources.NewConnectOnce[*gocql.Session](ctx, c.Name, SourceType, tracer),
+	}
 }
 
 // SourceConfigType implements sources.SourceConfig.
@@ -88,12 +95,27 @@ var _ sources.SourceConfig = Config{}
 
 type Source struct {
 	Config
-	Session *gocql.Session
+	tracer trace.Tracer
+	conn   *sources.ConnectOnce[*gocql.Session]
 }
 
-// ScyllaDBSession returns the underlying ScyllaDB session.
+// session returns the ScyllaDB session, creating it on first use.
+func (s *Source) session(ctx context.Context) (*gocql.Session, error) {
+	return s.conn.Do(ctx, func(ctx context.Context) (*gocql.Session, error) {
+		session, err := initScyllaDBSession(ctx, s.tracer, s.Config)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create session: %v", err)
+		}
+		return session, nil
+	})
+}
+
+// ScyllaDBSession reports the session if one has been made. It is the type
+// discriminator tools assert on; a deferred source has not connected yet, so
+// callers inside this package resolve through session instead.
 func (s *Source) ScyllaDBSession() *gocql.Session {
-	return s.Session
+	session, _ := s.conn.Get()
+	return session
 }
 
 func (s *Source) ToConfig() sources.SourceConfig {
@@ -110,8 +132,13 @@ func (s *Source) SourceType() string {
 }
 
 func (s *Source) RunSQL(ctx context.Context, statement string, params parameters.ParamValues) (any, error) {
+	session, err := s.session(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	sliceParams := params.AsSlice()
-	iter := s.ScyllaDBSession().Query(statement, sliceParams...).WithContext(ctx).Iter()
+	iter := session.Query(statement, sliceParams...).WithContext(ctx).Iter()
 
 	// Create a slice to store the output
 	var out []map[string]interface{}

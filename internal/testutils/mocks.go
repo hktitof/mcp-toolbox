@@ -17,6 +17,7 @@ package testutils
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/googleapis/mcp-toolbox/internal/prompts"
 	"github.com/googleapis/mcp-toolbox/internal/sources"
@@ -41,8 +42,22 @@ func (m MockSourceConfig) SourceConfigType() string {
 	return "mock-source"
 }
 
-func (m MockSourceConfig) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
+func (m MockSourceConfig) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
 	return MockSource{MockSourceConfig: m}, nil
+}
+
+// MockCountingSourceConfig counts eager connections, so a test can assert that
+// lazy initialization did not make one.
+type MockCountingSourceConfig struct {
+	MockSourceConfig
+	Connects *atomic.Int32
+}
+
+func (m MockCountingSourceConfig) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) (sources.Source, error) {
+	if !lazy && m.Connects != nil {
+		m.Connects.Add(1)
+	}
+	return MockSource{MockSourceConfig: m.MockSourceConfig}, nil
 }
 
 // MockSource is used to mock source in tests
