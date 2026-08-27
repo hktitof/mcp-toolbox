@@ -49,7 +49,6 @@ func newConfig(ctx context.Context, name string, decoder *yaml.Decoder) (tools.T
 }
 
 type compatibleSource interface {
-	BigQueryClient() *bigqueryapi.Client
 	UseClientAuthorization() bool
 	GetAuthTokenHeaderName() string
 	GetMaximumBytesBilled() int64
@@ -199,7 +198,7 @@ func (t Tool) Invoke(ctx context.Context, s sources.Source, params parameters.Pa
 			case 3: // project.dataset.table
 				projectID, datasetID = parts[0], parts[1]
 			case 2: // dataset.table
-				projectID, datasetID = source.BigQueryClient().Project(), parts[0]
+				projectID, datasetID = bqClient.Project(), parts[0]
 			default:
 				return nil, util.NewAgentError(fmt.Sprintf("invalid table ID format for 'input_data': %q. Expected 'dataset.table' or 'project.dataset.table'", inputData), nil)
 			}
