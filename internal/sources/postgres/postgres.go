@@ -83,10 +83,14 @@ func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, lazy bool) 
 }
 
 func (r Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
+	var opts []sources.Option
+	if r.ConnectTimeout != nil {
+		opts = append(opts, sources.WithConnectTimeout(time.Duration(*r.ConnectTimeout)*time.Second))
+	}
 	return &Source{
 		Config: r,
 		tracer: tracer,
-		conn:   sources.NewConnectOnce[*pgxpool.Pool](ctx, r.Name, SourceType, tracer),
+		conn:   sources.NewConnectOnce[*pgxpool.Pool](ctx, r.Name, SourceType, tracer, opts...),
 	}
 }
 

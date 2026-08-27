@@ -27,12 +27,29 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// ConnectTimeout bounds a deferred connection. The attempt is shared by every
-// caller waiting on it, so it cannot take any single caller's deadline; this
-// ceiling is what stops a partitioned network from pinning it open. It is
-// sized for a cold cloud connector path (token fetch, instance metadata
-// lookup, TLS handshake) rather than for a healthy connection.
+// ConnectTimeout is the default ceiling on a deferred connection. The attempt
+// is shared by every caller waiting on it, so it cannot take any single
+// caller's deadline; this ceiling is what stops a partitioned network from
+// pinning it open. It is sized for a cold cloud connector path (token fetch,
+// instance metadata lookup, TLS handshake) rather than for a healthy
+// connection.
 const ConnectTimeout = 60 * time.Second
+
+// Option configures a ConnectOnce.
+type Option func(*options)
+
+type options struct {
+	timeout time.Duration
+}
+
+// WithConnectTimeout raises the ceiling for a source whose own configuration
+// bounds the connection attempt by more than ConnectTimeout, so that the
+// default does not silently truncate a value an operator set deliberately. A
+// shorter value is ignored: the source's own bound still applies inside the
+// ceiling, and lowering the ceiling would not make it any tighter.
+func WithConnectTimeout(d time.Duration) Option {
+	return func(o *options) { o.timeout = d }
+}
 
 // ConnectOnce holds a connection a source builds on first use. A source that
 // supports deferred initialization keeps one of these instead of a bare
@@ -46,6 +63,7 @@ type ConnectOnce[T any] struct {
 	sourceType string
 	tracer     trace.Tracer
 	userAgent  string
+	timeout    time.Duration
 
 	mu    sync.RWMutex
 	value T
@@ -62,9 +80,16 @@ type ConnectOnce[T any] struct {
 // ctx must be the context Initialize was called with, so the user agent it
 // carries — which includes --user-agent-metadata — is the one every later
 // connect reports.
-func NewConnectOnce[T any](ctx context.Context, name, sourceType string, tracer trace.Tracer) *ConnectOnce[T] {
+func NewConnectOnce[T any](ctx context.Context, name, sourceType string, tracer trace.Tracer, opts ...Option) *ConnectOnce[T] {
 	userAgent, _ := util.UserAgentFromContext(ctx)
-	return &ConnectOnce[T]{name: name, sourceType: sourceType, tracer: tracer, userAgent: userAgent}
+	o := options{timeout: ConnectTimeout}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if o.timeout < ConnectTimeout {
+		o.timeout = ConnectTimeout
+	}
+	return &ConnectOnce[T]{name: name, sourceType: sourceType, tracer: tracer, userAgent: userAgent, timeout: o.timeout}
 }
 
 // Get returns the connection if one has already been made. It never blocks and
@@ -96,7 +121,7 @@ func (c *ConnectOnce[T]) Do(ctx context.Context, connect func(context.Context) (
 		// The attempt is shared by every caller waiting on it, so it must not
 		// inherit the cancellation of whichever caller happened to start it.
 		// WithoutCancel keeps the trace context so the span still parents.
-		connectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ConnectTimeout)
+		connectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.timeout)
 		defer cancel()
 
 		// Drivers read the user agent from the context they connect with.

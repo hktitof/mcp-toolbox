@@ -104,11 +104,18 @@ func (r Config) newSource(ctx context.Context, tracer trace.Tracer) *Source {
 	if useOAuth := strings.ToLower(r.UseClientOAuth); useOAuth != "false" && useOAuth != "true" {
 		authTokenHeaderName = r.UseClientOAuth
 	}
+	// The connect logs in through the SDK, and that call is bounded by the
+	// configured timeout — 600s by default, ten times the ceiling. A value that
+	// fails to parse is reported by the connect itself.
+	var opts []sources.Option
+	if d, err := time.ParseDuration(r.Timeout); err == nil {
+		opts = append(opts, sources.WithConnectTimeout(d))
+	}
 	return &Source{
 		Config:              r,
 		AuthTokenHeaderName: authTokenHeaderName,
 		tracer:              tracer,
-		conn:                sources.NewConnectOnce[*clientSet](ctx, r.Name, SourceType, tracer),
+		conn:                sources.NewConnectOnce[*clientSet](ctx, r.Name, SourceType, tracer, opts...),
 	}
 }
 
