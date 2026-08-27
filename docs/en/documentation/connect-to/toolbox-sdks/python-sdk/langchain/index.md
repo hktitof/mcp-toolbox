@@ -423,6 +423,39 @@ dynamic_bound_tool = tool.bind_param("param", get_dynamic_value)
 You don’t need to modify tool configurations to bind parameter values.
 {{< /notice >}}
 
+### Secure Parameters
+
+{{< notice note >}}
+Secure parameters are supported starting in `toolbox-langchain` version `1.4.0` (with `toolbox-core` >= `1.4.0`) and require MCP protocol version `2026-07-28` or newer with the `com.google.cloud/toolbox.v1` extension.
+{{< /notice >}}
+
+Secure parameters are designed for sensitive runtime values (such as an end-user `customer_id`, tenant identifier, or secret tokens) that LLMs must not see or control.
+
+* **Schema Isolation:** Secure parameters are automatically excluded from LangChain's `tool.args_schema`, so models using `model.bind_tools(tools)` will never see or request them.
+* **Prompt Injection Defense:** If a model attempts to supply a secure parameter in standard arguments, execution fails immediately.
+* **Binding While Loading or After:** You can provide secure parameters when loading tools or bind them to loaded tools:
+
+```py
+from toolbox_langchain import ToolboxClient
+
+client = ToolboxClient("http://127.0.0.1:5000")
+
+# Option A: Bind secure parameters when loading tools
+tool = client.load_tool("search_secure_data", secure_params={"customer_id": "cust_12345"})
+tools = client.load_toolset("my-set", secure_params={"customer_id": "cust_12345"})
+
+# Option B: Bind secure parameters to an existing loaded tool (returns a new tool clone)
+bound_tool = tool.bind_secure_param("customer_id", "cust_12345")
+multi_bound = tool.bind_secure_params({
+    "customer_id": "cust_12345",
+    "api_key": "secret-key",
+})
+
+# Option C: Dynamic callable
+dynamic_tool = tool.bind_secure_param("customer_id", lambda: get_current_user_id())
+```
+
+
 ## Asynchronous Usage
 
 For better performance through [cooperative

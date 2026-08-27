@@ -425,6 +425,51 @@ const dynamicBoundTool = tool.bindParam("param", getDynamicValue)
 You don't need to modify tool configurations to bind parameter values.
 {{< /notice >}}
 
+## Secure Parameters
+
+{{< notice note >}}
+Secure parameters are supported starting in `@google-cloud/toolbox-adk` version `1.2.0` (with `@google-cloud/toolbox-core` >= `1.2.0`) and require MCP protocol version `2026-07-28` or newer with the `com.google.cloud/toolbox.v1` extension.
+{{< /notice >}}
+
+Secure parameters are designed for sensitive runtime values (such as an end-user `customer_id`, tenant identifier, or secret tokens) that LLMs must not see or control.
+
+* **Schema Isolation:** When loaded tools are passed to an ADK `LlmAgent`, secure parameters are completely omitted from the tool parameter declarations, ensuring the LLM never prompts for or hallucinates them.
+* **Prompt Injection Defense:** If an agent attempts to call a tool with a secure parameter supplied in standard arguments, execution fails immediately.
+* **Binding Methods:** Secure parameters can be pre-bound when loading tools or bound to tool instances:
+
+```javascript
+import { ToolboxClient } from '@toolbox-sdk/adk';
+
+const client = new ToolboxClient("http://127.0.0.1:5000");
+
+// Option A: Pre-bind secure parameters during loadTool / loadToolset
+const tool = await client.loadTool(
+    "search_secure_data",
+    null, // authTokenGetters
+    null, // boundParams
+    { customer_id: "cust_12345" } // secureParams
+);
+
+const tools = await client.loadToolset(
+    "my-toolset",
+    null, // authTokenGetters
+    null, // boundParams
+    true, // strict
+    { customer_id: "cust_12345" } // secureParams
+);
+
+// Option B: Bind on an existing loaded tool (returns a new immutable clone)
+const boundTool = tool.bindSecureParam("customer_id", "cust_12345");
+const multiBound = tool.bindSecureParams({
+    customer_id: "cust_12345",
+    api_key: "secret-token",
+});
+
+// Option C: Dynamic callable
+const dynamicTool = tool.bindSecureParam("auth_token", async () => fetchAuthToken());
+```
+
+
 # Using with ADK
 
 ADK JS:

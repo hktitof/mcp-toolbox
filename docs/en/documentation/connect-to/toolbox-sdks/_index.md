@@ -10,7 +10,7 @@ Our Toolbox Client SDKs provide the foundational building blocks for connecting 
 
 Whether you are writing a simple script to execute a single query or building a complex, multi-agent orchestration system, these SDKs handle the underlying Model Context Protocol (MCP) communication so you can focus on your business logic.
 
-By using our SDKs, your application can dynamically request tools, bind parameters, add authentication, and execute commands at runtime. We offer official support and deep framework integrations across three primary languages:
+By using our SDKs, your application can dynamically request tools, bind parameters, provide secure parameters out-of-band, add authentication, and execute commands at runtime. We offer official support and deep framework integrations across three primary languages:
 
 *   **[Python](./python-sdk/)**: Includes the Core SDK, along with native integrations for popular orchestrators like LangChain, LlamaIndex, and the ADK.
 *   **[JavaScript / TypeScript](./javascript-sdk/)**: Includes the Node.js Core SDK and integrations for the Agent Development Kit (ADK).

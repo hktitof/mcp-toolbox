@@ -260,6 +260,43 @@ toolset = ToolboxToolset(
 )
 ```
 
+### Secure Parameters
+
+{{< notice note >}}
+Secure parameters are supported starting in `toolbox-adk` version `1.4.0` (with `toolbox-core` >= `1.4.0`) and require MCP protocol version `2026-07-28` or newer with the `com.google.cloud/toolbox.v1` extension.
+{{< /notice >}}
+
+Secure parameters are designed for sensitive runtime values (such as an end-user `customer_id`, tenant identifier, or secret tokens) that LLMs must not see or control.
+
+When tools define `secure: true` parameters in their Toolbox server configuration:
+* **Schema Isolation:** Secure parameters are completely stripped from the ADK tool declaration (`tool.declaration`), so the LLM model never sees them in prompt instructions or context windows.
+* **Prompt Injection Defense:** If a model attempts to generate arguments containing a secure parameter name, execution is rejected immediately.
+* **Direct Application Injection:** Secure parameters must be supplied directly by your application out-of-band:
+
+```python
+from toolbox_adk import ToolboxToolset, ToolboxClient
+
+# Option A: Bind secure parameters globally on ToolboxToolset
+toolset = ToolboxToolset(
+    server_url="http://127.0.0.1:5000",
+    secure_params={
+        "customer_id": "cust_12345",
+        "auth_token": lambda: get_auth_token(),  # Callables supported
+    },
+)
+
+# Option B: Bind secure parameters when loading tools via ToolboxClient
+client = ToolboxClient("http://127.0.0.1:5000")
+tool = await client.load_tool(
+    "search_secure_data",
+    secure_params={"customer_id": "cust_12345"}
+)
+
+# Option C: Bind to an existing loaded tool (returns a new immutable tool)
+bound_tool = tool.bind_secure_param("customer_id", "cust_12345")
+```
+
+
 ## OpenTelemetry
 
 The SDK supports OpenTelemetry tracing and metrics via the `toolbox-core` layer, following the [MCP Semantic Conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp).

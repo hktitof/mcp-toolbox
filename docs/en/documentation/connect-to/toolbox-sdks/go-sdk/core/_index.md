@@ -529,6 +529,103 @@ dynamicBoundTool, err := tool.ToolFrom(core.WithBindParamStringFunc("param", get
 
 {{< notice info >}} You don't need to modify tool configurations to bind parameter values. {{< /notice >}}
 
+## Secure Parameters
+
+{{< notice note >}}
+Secure parameters are supported starting in [`github.com/googleapis/mcp-toolbox-sdk-go/core`](https://github.com/googleapis/mcp-toolbox-sdk-go/tree/main/core) version `v1.2.0` and require MCP [protocol version `2026-07-28`](#supported-protocols) or newer with the [`com.google.cloud/toolbox.v1` extension](https://github.com/googleapis/mcp-toolbox/blob/main/extensions/2026-07-28/README.md). For server configuration details, see [Secure Parameters](../../../../configuration/tools/_index.md#secure-parameters).
+{{< /notice >}}
+
+Secure parameters are designed for sensitive runtime context (such as an end-user `customer_id`, tenant identifier, or secret tokens) that LLMs must not see, control, or hallucinate.
+
+Unlike standard parameters, parameters marked as `secure: true` in your Toolbox server configuration:
+* **Schema Isolation:** The SDK completely strips secure parameters from the public tool declaration and parameter schema (`tool.Parameters()`). The LLM is never aware of these parameters, keeping your model's context window clean and preventing credential exposure.
+* **Prompt Injection Defense:** If a model or caller attempts to provide a value for a secure parameter in standard arguments, the SDK rejects execution immediately.
+* **Fast-Fail Validation:** The SDK verifies all required secure parameters locally before sending a request over the wire. If any required secure parameter is missing, execution fails immediately.
+* **Wire Protocol Separation:** Secure parameters are transmitted out-of-band in the `secureArguments` field of the MCP 2026-07-28 `tools/call` JSON-RPC payload, isolated from regular arguments.
+
+### Option A: Add Default Secure Parameters to a Client
+
+You can set default secure parameters at the client level. Every tool or toolset loaded by the client inherits these bindings:
+
+```go
+ctx := context.Background()
+
+client, err := core.NewToolboxClient("http://127.0.0.1:5000",
+    core.WithDefaultToolOptions(
+        core.WithBindSecureParamString("customer_id", "cust_12345"),
+    ),
+)
+
+tool, err := client.LoadTool("search_secure_data", ctx)
+```
+
+### Option B: Binding Secure Parameters to a Loaded Tool
+
+Bind secure values to a tool object *after* it has been loaded. Each method returns a **new, immutable tool instance**, leaving the original unmodified.
+
+```go
+client, err := core.NewToolboxClient("http://127.0.0.1:5000")
+tool, err := client.LoadTool("search_secure_data", ctx)
+
+// Using ToolFrom with functional options
+boundTool, err := tool.ToolFrom(
+    core.WithBindSecureParamString("customer_id", "cust_12345"),
+    core.WithBindSecureParamString("api_key", "secret-token-value"),
+)
+
+// OR using direct helper methods on ToolboxTool
+boundTool, err = tool.BindSecureParam("customer_id", "cust_12345")
+multiBoundTool, err := tool.BindSecureParams(map[string]any{
+    "customer_id": "cust_12345",
+    "api_key":     "secret-token-value",
+})
+```
+
+### Option C: Binding Secure Parameters While Loading Tools
+
+Specify secure parameters directly when loading tools. This applies the binding only to the tools loaded in that specific call:
+
+```go
+// Load a single tool with secure parameters
+boundTool, err := client.LoadTool("search_secure_data", ctx,
+    core.WithBindSecureParamString("customer_id", "cust_12345"),
+)
+
+// Load an entire toolset with secure parameters
+boundTools, err := client.LoadToolset("my-toolset", ctx,
+    core.WithBindSecureParamString("customer_id", "cust_12345"),
+)
+```
+
+### Binding Dynamic Secure Values
+
+You can also bind a secure parameter to a function that is evaluated dynamically each time the tool is invoked:
+
+```go
+getDynamicToken := func() (string, error) {
+    return "dynamic-session-token-xyz", nil
+}
+
+dynamicBoundTool, err := tool.ToolFrom(
+    core.WithBindSecureParamStringFunc("auth_token", getDynamicToken),
+)
+```
+
+### Supported Type-Safe Option Helpers
+
+The Go SDK provides type-safe options for static values and dynamic getter functions:
+
+| Type | Static Option | Dynamic Function Option |
+| :--- | :--- | :--- |
+| `string` | `core.WithBindSecureParamString(name, val)` | `core.WithBindSecureParamStringFunc(name, fn)` |
+| `int` | `core.WithBindSecureParamInt(name, val)` | `core.WithBindSecureParamIntFunc(name, fn)` |
+| `float64` | `core.WithBindSecureParamFloat(name, val)` | `core.WithBindSecureParamFloatFunc(name, fn)` |
+| `bool` | `core.WithBindSecureParamBool(name, val)` | `core.WithBindSecureParamBoolFunc(name, fn)` |
+| `[]string` | `core.WithBindSecureParamStringArray(name, val)` | `core.WithBindSecureParamStringArrayFunc(name, fn)` |
+| `map[string]string` | `core.WithBindSecureParamStringMap(name, val)` | `core.WithBindSecureParamStringMapFunc(name, fn)` |
+| `map[string]any` | `core.WithBindSecureParamAnyMap(name, val)` | `core.WithBindSecureParamAnyMapFunc(name, fn)` |
+
+
 ## Default Parameters
 
 Tools defined in the MCP Toolbox server can specify default values for their optional parameters. When invoking a tool using the SDK, if an input for a parameter with a default value is not provided, the SDK will automatically populate the request with the default value.
