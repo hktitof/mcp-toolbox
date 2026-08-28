@@ -2207,16 +2207,21 @@ func RunPostgresListActiveQueriesTest(t *testing.T, ctx context.Context, pool *p
 			}
 
 			if tc.compareSubset {
-				// Assert that the expected query is present in the active queries list.
-				found := false
-				for _, d := range details {
-					if d.Query == singleQueryWanted.Query {
-						found = true
-						break
-					}
+				wantQueries, ok := tc.want.([]queryListDetails)
+				if !ok {
+					t.Fatalf("tc.want must be of type []queryListDetails when compareSubset is true")
 				}
-				if !found {
-					t.Errorf("Expected query %q not found in active queries: %#v", singleQueryWanted.Query, details)
+				for _, wantQ := range wantQueries {
+					found := false
+					for _, d := range details {
+						if d.Query == wantQ.Query {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Errorf("Expected query %q not found in active queries: %#v", wantQ.Query, details)
+					}
 				}
 			} else {
 				// Verify that none of our test sleep queries are present.
