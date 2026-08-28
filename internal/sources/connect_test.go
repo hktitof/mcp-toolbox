@@ -30,8 +30,7 @@ import (
 // handle stands in for whatever a source connects to.
 type handle struct{ id int }
 
-// connector records how a source's connect function was called, so tests can
-// observe coalescing, retries and the context the connect actually saw.
+// connector records how a source's connect function was called.
 type connector struct {
 	mu       sync.Mutex
 	calls    int
@@ -43,21 +42,17 @@ type connector struct {
 }
 
 func (c *connector) connect(ctx context.Context) (*handle, error) {
+	ua, _ := util.UserAgentFromContext(ctx)
+	deadline, _ := ctx.Deadline()
+
 	c.mu.Lock()
 	c.calls++
 	id, err, delay := c.calls, c.err, c.delay
-	c.mu.Unlock()
-
-	ua, _ := util.UserAgentFromContext(ctx)
-	deadline, _ := ctx.Deadline()
-	c.mu.Lock()
-	c.userAg = ua
-	c.deadline = deadline
+	c.userAg, c.deadline = ua, deadline
 	c.mu.Unlock()
 
 	// Holding the connection open lets concurrent callers pile up behind it, so
-	// a missing singleflight shows up as extra calls. Watching ctx here is what
-	// lets a test observe whether the shared attempt inherited a cancellation.
+	// a missing singleflight shows up as extra calls.
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
@@ -176,8 +171,7 @@ func TestConnectOnceRespectsCallerDeadline(t *testing.T) {
 	c := &connector{delay: time.Minute}
 	once := newConnectOnce(context.Background())
 
-	// A hung connect must not pin the request for ConnectTimeout: the caller
-	// returns on its own deadline and the agent gets a readable error.
+	// A hung connect must not pin the request for ConnectTimeout.
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
@@ -202,8 +196,6 @@ func TestConnectOnceRetriesAfterFailure(t *testing.T) {
 		t.Fatal("a failed connection must not be cached")
 	}
 
-	// A failure is not cached, so a source that comes up later starts working
-	// without restarting the server.
 	c.mu.Lock()
 	c.err = nil
 	c.mu.Unlock()
@@ -236,83 +228,80 @@ func TestConnectOnceReusesTheConnection(t *testing.T) {
 	}
 }
 
-func TestConnectOnceRestoresStartupUserAgent(t *testing.T) {
-	// Drivers read the user agent from the context they connect with. A
-	// deferred connect runs from a request context, whose user agent omits
-	// --user-agent-metadata, so the startup value has to be reapplied or a
-	// lazily connected source would identify itself differently than an
-	// eagerly connected one.
-	startupCtx := testutils.ContextWithUserAgent(context.Background(), "1.2.3+custom-metadata")
-	once := newConnectOnce(startupCtx)
-
-	c := &connector{}
-	callerCtx := testutils.ContextWithUserAgent(context.Background(), "1.2.3")
-	if _, err := once.Do(callerCtx, c.connect); err != nil {
-		t.Fatalf("unexpected error connecting: %s", err)
+func TestConnectOnceCeiling(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []sources.Option
+		want time.Duration
+	}{
+		{
+			name: "default ceiling",
+			want: sources.ConnectTimeout,
+		},
+		{
+			name: "configured value longer than the ceiling raises it",
+			opts: []sources.Option{sources.WithConnectTimeout(10 * time.Minute)},
+			want: 10 * time.Minute,
+		},
+		{
+			name: "configured value shorter than the ceiling is ignored",
+			opts: []sources.Option{sources.WithConnectTimeout(time.Millisecond)},
+			want: sources.ConnectTimeout,
+		},
 	}
 
-	want := "genai-toolbox/1.2.3+custom-metadata"
-	if got := c.observedUserAgent(); got != want {
-		t.Errorf("connect saw user agent %q, want %q", got, want)
-	}
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &connector{}
+			once := newConnectOnce(context.Background(), tc.opts...)
 
-func TestConnectOnceCapsTheSharedAttempt(t *testing.T) {
-	c := &connector{}
-	once := newConnectOnce(context.Background())
-
-	start := time.Now()
-	if _, err := once.Do(context.Background(), c.connect); err != nil {
-		t.Fatalf("unexpected error connecting: %s", err)
-	}
-	if got := c.observedTimeout(start); (got - sources.ConnectTimeout).Abs() > time.Second {
-		t.Fatalf("shared attempt bounded at %s, want the %s ceiling", got, sources.ConnectTimeout)
-	}
-}
-
-func TestConnectOnceRaisesCeilingForLongerConfiguredTimeout(t *testing.T) {
-	// A source whose own configuration allows a longer attempt than the ceiling
-	// — Looker's default timeout is 600s — must not have that value silently
-	// shortened to 60s by the deferred path.
-	const configured = 10 * time.Minute
-	c := &connector{}
-	once := newConnectOnce(context.Background(), sources.WithConnectTimeout(configured))
-
-	start := time.Now()
-	if _, err := once.Do(context.Background(), c.connect); err != nil {
-		t.Fatalf("unexpected error connecting: %s", err)
-	}
-	if got := c.observedTimeout(start); (got - configured).Abs() > time.Second {
-		t.Fatalf("shared attempt bounded at %s, want the configured %s", got, configured)
+			start := time.Now()
+			if _, err := once.Do(context.Background(), c.connect); err != nil {
+				t.Fatalf("unexpected error connecting: %s", err)
+			}
+			if got := c.observedTimeout(start); (got - tc.want).Abs() > time.Second {
+				t.Errorf("shared attempt bounded at %s, want %s", got, tc.want)
+			}
+		})
 	}
 }
 
-func TestConnectOnceIgnoresShorterConfiguredTimeout(t *testing.T) {
-	// The source's own bound still applies inside the ceiling, so lowering the
-	// ceiling would only cut the attempt short of what the default allows.
-	c := &connector{delay: 100 * time.Millisecond}
-	once := newConnectOnce(context.Background(), sources.WithConnectTimeout(time.Millisecond))
-
-	start := time.Now()
-	if _, err := once.Do(context.Background(), c.connect); err != nil {
-		t.Fatalf("a configured timeout below the ceiling must not bound the attempt: %s", err)
-	}
-	if got := c.observedTimeout(start); got < sources.ConnectTimeout-time.Second {
-		t.Fatalf("shared attempt bounded at %s, want the %s ceiling", got, sources.ConnectTimeout)
-	}
-}
-
-func TestConnectOnceKeepsCallerUserAgentWhenStartupHadNone(t *testing.T) {
-	once := newConnectOnce(context.Background())
-
-	c := &connector{}
-	callerCtx := testutils.ContextWithUserAgent(context.Background(), "1.2.3")
-	if _, err := once.Do(callerCtx, c.connect); err != nil {
-		t.Fatalf("unexpected error connecting: %s", err)
+func TestConnectOnceUserAgent(t *testing.T) {
+	tests := []struct {
+		name      string
+		startupUA string
+		callerUA  string
+		want      string
+	}{
+		{
+			name:      "startup user agent is restored",
+			startupUA: "1.2.3+custom-metadata",
+			callerUA:  "1.2.3",
+			want:      "genai-toolbox/1.2.3+custom-metadata",
+		},
+		{
+			name:     "caller user agent is kept when startup had none",
+			callerUA: "1.2.3",
+			want:     "genai-toolbox/1.2.3",
+		},
 	}
 
-	want := "genai-toolbox/1.2.3"
-	if got := c.observedUserAgent(); got != want {
-		t.Errorf("connect saw user agent %q, want %q", got, want)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			startupCtx := context.Background()
+			if tc.startupUA != "" {
+				startupCtx = testutils.ContextWithUserAgent(startupCtx, tc.startupUA)
+			}
+			once := newConnectOnce(startupCtx)
+
+			c := &connector{}
+			callerCtx := testutils.ContextWithUserAgent(context.Background(), tc.callerUA)
+			if _, err := once.Do(callerCtx, c.connect); err != nil {
+				t.Fatalf("unexpected error connecting: %s", err)
+			}
+			if got := c.observedUserAgent(); got != tc.want {
+				t.Errorf("connect saw user agent %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

@@ -201,8 +201,6 @@ func (r Config) newSource(ctx context.Context, tracer trace.Tracer) (*Source, er
 	s := &Source{
 		Config:              r,
 		AuthTokenHeaderName: authTokenHeaderName,
-		MaxQueryResultRows:  r.MaxQueryResultRows,
-		MaximumBytesBilled:  r.MaximumBytesBilled,
 		AllowedDatasets:     allowedDatasets,
 		tracer:              tracer,
 		conn:                sources.NewConnectOnce[*clientSet](ctx, r.Name, SourceType, tracer),
@@ -349,8 +347,6 @@ func (s *Source) cachingClientCreator(baseCreator BigqueryClientCreator) Bigquer
 type Source struct {
 	Config
 	AuthTokenHeaderName       string
-	MaxQueryResultRows        int
-	MaximumBytesBilled        int64
 	AllowedDatasets           map[string]struct{}
 	SessionProvider           BigQuerySessionProvider
 	Session                   *Session

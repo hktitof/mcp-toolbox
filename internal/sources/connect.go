@@ -27,12 +27,8 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// ConnectTimeout is the default ceiling on a deferred connection. The attempt
-// is shared by every caller waiting on it, so it cannot take any single
-// caller's deadline; this ceiling is what stops a partitioned network from
-// pinning it open. It is sized for a cold cloud connector path (token fetch,
-// instance metadata lookup, TLS handshake) rather than for a healthy
-// connection.
+// ConnectTimeout is the default ceiling on a connection attempt. It is sized
+// for a cold cloud connector path rather than for a healthy connection.
 const ConnectTimeout = 60 * time.Second
 
 // Option configures a ConnectOnce.
@@ -43,21 +39,13 @@ type options struct {
 }
 
 // WithConnectTimeout raises the ceiling for a source whose own configuration
-// bounds the connection attempt by more than ConnectTimeout, so that the
-// default does not silently truncate a value an operator set deliberately. A
-// shorter value is ignored: the source's own bound still applies inside the
-// ceiling, and lowering the ceiling would not make it any tighter.
+// allows a longer connect. A shorter value is ignored.
 func WithConnectTimeout(d time.Duration) Option {
 	return func(o *options) { o.timeout = d }
 }
 
-// ConnectOnce holds a connection a source builds on first use. A source that
-// supports deferred initialization keeps one of these instead of a bare
-// handle, and its accessors resolve through Do.
-//
-// Construct it during Initialize so it captures the startup context: the
-// connect itself runs from whichever request triggers it, and a request
-// context carries neither the tracer nor the same user agent.
+// ConnectOnce holds a connection a source builds on first use. A source keeps
+// one of these instead of a bare handle and resolves it through Do.
 type ConnectOnce[T any] struct {
 	name       string
 	sourceType string
@@ -69,17 +57,14 @@ type ConnectOnce[T any] struct {
 	value T
 	ready bool
 
-	// initGroup, not mu, is what serializes connecting: mu is held only across
-	// field access, never across the connect. A mutex held for the length of a
-	// connect would also block a caller from abandoning a hung attempt, which
-	// the select in Do relies on being able to do.
+	// initGroup, not mu, serializes connecting. A mutex held for the length of
+	// a connect would block a caller from abandoning a hung attempt.
 	initGroup singleflight.Group
 }
 
 // NewConnectOnce returns a holder for a connection that has not been made yet.
-// ctx must be the context Initialize was called with, so the user agent it
-// carries — which includes --user-agent-metadata — is the one every later
-// connect reports.
+// ctx must be the context Initialize was called with, so that the user agent it
+// carries is the one every later connect reports.
 func NewConnectOnce[T any](ctx context.Context, name, sourceType string, tracer trace.Tracer, opts ...Option) *ConnectOnce[T] {
 	userAgent, _ := util.UserAgentFromContext(ctx)
 	o := options{timeout: ConnectTimeout}
@@ -93,8 +78,7 @@ func NewConnectOnce[T any](ctx context.Context, name, sourceType string, tracer 
 }
 
 // Get returns the connection if one has already been made. It never blocks and
-// never fails, so paths that must not pay for a connect can ask without
-// triggering one.
+// never fails.
 func (c *ConnectOnce[T]) Get() (T, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -102,8 +86,7 @@ func (c *ConnectOnce[T]) Get() (T, bool) {
 }
 
 // Do returns the connection, making it on the first call. Concurrent callers
-// share one attempt; a failed attempt is not remembered, so a source that was
-// down starts working on a later call without a restart.
+// share one attempt, and a failed attempt is not remembered.
 func (c *ConnectOnce[T]) Do(ctx context.Context, connect func(context.Context) (T, error)) (T, error) {
 	var zero T
 	if value, ok := c.Get(); ok {
@@ -111,23 +94,19 @@ func (c *ConnectOnce[T]) Do(ctx context.Context, connect func(context.Context) (
 	}
 
 	ch := c.initGroup.DoChan("", func() (any, error) {
-		// A caller that queued behind a winner which already finished would
-		// otherwise start a second connect, since singleflight only shares an
-		// attempt that is still in flight.
+		// singleflight only shares an attempt that is still in flight, so a
+		// caller queued behind a finished winner would start a second connect.
 		if value, ok := c.Get(); ok {
 			return value, nil
 		}
 
-		// The attempt is shared by every caller waiting on it, so it must not
-		// inherit the cancellation of whichever caller happened to start it.
-		// WithoutCancel keeps the trace context so the span still parents.
+		// The attempt is shared by every waiter, so it must not inherit the
+		// cancellation of whichever caller started it.
 		connectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.timeout)
 		defer cancel()
 
-		// Drivers read the user agent from the context they connect with.
-		// Eager init runs under the startup context, which carries
-		// --user-agent-metadata; a deferred connect runs under a request
-		// context, which does not.
+		// A deferred connect runs under a request context, whose user agent
+		// omits --user-agent-metadata.
 		if c.userAgent != "" {
 			connectCtx = util.WithUserAgentValue(connectCtx, c.userAgent)
 		}
@@ -160,8 +139,7 @@ func (c *ConnectOnce[T]) Do(ctx context.Context, connect func(context.Context) (
 		value, _ := res.Val.(T)
 		return value, nil
 	case <-ctx.Done():
-		// Only this caller gives up; the shared attempt runs on for the others
-		// and caches the connection if it succeeds.
+		// Only this caller gives up; the shared attempt runs on for the others.
 		return zero, fmt.Errorf("unable to initialize source %q: %w", c.name, ctx.Err())
 	}
 }
