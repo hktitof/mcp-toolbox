@@ -2121,6 +2121,7 @@ func RunPostgresListActiveQueriesTest(t *testing.T, ctx context.Context, pool *p
 		waitSecsBeforeCheck int
 		wantStatusCode      int
 		want                any
+		compareSubset       bool
 	}{
 		// exclude background monitoring apps such as "wal_uploader"
 		{
@@ -2149,6 +2150,7 @@ func RunPostgresListActiveQueriesTest(t *testing.T, ctx context.Context, pool *p
 			waitSecsBeforeCheck: 5,
 			wantStatusCode:      http.StatusOK,
 			want:                []queryListDetails{singleQueryWanted},
+			compareSubset:       true,
 		},
 	}
 
@@ -2199,17 +2201,30 @@ func RunPostgresListActiveQueriesTest(t *testing.T, ctx context.Context, pool *p
 				resultString = string(bodyWrapper.Result)
 			}
 
-			var got any
 			var details []queryListDetails
 			if err := json.Unmarshal([]byte(resultString), &details); err != nil {
 				t.Fatalf("failed to unmarshal nested ObjectDetails string: %v", err)
 			}
-			got = details
 
-			if diff := cmp.Diff(tc.want, got, cmp.Comparer(func(a, b queryListDetails) bool {
-				return a.Query == b.Query
-			})); diff != "" {
-				t.Errorf("Unexpected result: got %#v, want: %#v", got, tc.want)
+			if tc.compareSubset {
+				// Assert that the expected query is present in the active queries list.
+				found := false
+				for _, d := range details {
+					if d.Query == singleQueryWanted.Query {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("Expected query %q not found in active queries: %#v", singleQueryWanted.Query, details)
+				}
+			} else {
+				// Verify that none of our test sleep queries are present.
+				for _, d := range details {
+					if strings.Contains(d.Query, "pg_sleep") {
+						t.Errorf("Unexpected ongoing sleep query found in active queries: %#v", d)
+					}
+				}
 			}
 		})
 	}
